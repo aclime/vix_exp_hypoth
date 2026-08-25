@@ -224,25 +224,23 @@ def option_liquidation_query(tick,option_ids,liquid_date):
     }
 
     req=f"""
-    SELECT *
+    SELECT DISTINCT ON (optionid) date as liquidation_midprice_date, 
+                (best_bid+best_offer)/2 AS liquidation_midprice
     FROM optionm.opprcd{liquid_date.year} AS tbl 
     WHERE secid = {sec_id_map.get(tick)}
         AND optionid in {tuple([int(i) for i in option_ids])}
+        AND date < {liquid_date.strftime('%Y-%m-%d')}
+    ORDER BY optionid, date DESC;
     """
 
     df = db.raw_sql(req, date_cols=['date','exdate','last_date'])
-    df.strike_price/=1_000
-    df=df.copy()
-    df=df[df['date']<=liquid_date]
-    df['liquidation_bid']=df.groupby(['optionid'])['best_bid'].ffill()
-    df['liquidation_offer']=df.groupby(['optionid'])['best_offer'].ffill()
-    df['liquidation_midprice']=(df['liquidation_offer']+df['liquidation_bid'])/2
-    df=df.loc[df.groupby('optionid')['date'].idxmax()]
-    df.rename(columns={'date':'liquidation_midprice_date'},inplace=True)
+    #df.strike_price/=1_000
+    #df=df.copy()
     df=df[['optionid','liquidation_midprice_date','liquidation_midprice']]
-    #could do minimum of max dates by optionid
-    #display(df.head())
     return df
+
+
+
 
 def option_deltas_query(tick,option_ids,start,end):
     """
@@ -351,3 +349,41 @@ def quote_uniqueness_aggregation(tick,lb_year,ub_year):
 #GROUP BY date, days_to_expiration
 #ORDER BY date, days_to_expiration;
 #"""
+
+def option_liquidation_query_OLD(tick,option_ids,liquid_date):
+    """
+    get prices for a list of optionids on a day provided
+    """
+    sec_id_map={'DJX':102456, #Dow Jones Industrial Average
+    'NDX':102480, #NASDAQ 100 Index
+    'MNX':102491, #CBOE Mini-NDX Index
+    'XMI':101499, #AMEX Major Market Index
+    'SPX':108105, #S&P 500 Index
+    'OEX':109764, #S&P 100 Index
+    'MID':101507, #S&P Midcap 400 Index
+    'SML':102442, #S&P Smallcap 600 Index
+    'RUT':102434, #Russell 2000 Index
+    'NYZ':107880, #NYSE Composite Index (Old)
+    'WSX':108656  #PSE Wilshire Smallcap Index
+    }
+
+    req=f"""
+    SELECT *
+    FROM optionm.opprcd{liquid_date.year} AS tbl 
+    WHERE secid = {sec_id_map.get(tick)}
+        AND optionid in {tuple([int(i) for i in option_ids])}
+    """
+
+    df = db.raw_sql(req, date_cols=['date','exdate','last_date'])
+    df.strike_price/=1_000
+    df=df.copy()
+    df=df[df['date']<=liquid_date]
+    df['liquidation_bid']=df.groupby(['optionid'])['best_bid'].ffill()
+    df['liquidation_offer']=df.groupby(['optionid'])['best_offer'].ffill()
+    df['liquidation_midprice']=(df['liquidation_offer']+df['liquidation_bid'])/2
+    df=df.loc[df.groupby('optionid')['date'].idxmax()]
+    df.rename(columns={'date':'liquidation_midprice_date'},inplace=True)
+    df=df[['optionid','liquidation_midprice_date','liquidation_midprice']]
+    #could do minimum of max dates by optionid
+    #display(df.head())
+    return df
