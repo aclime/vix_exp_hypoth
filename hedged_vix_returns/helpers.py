@@ -1,0 +1,1854 @@
+#Source Materials
+# KNS SKEW & GVIX (Kozhan, Neuberger, Schneider)
+    #GVIX is the 'entropy contract' in the paper
+    #The Skew Risk Premium in the Equity Index Market
+    #https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1571700
+#SVIX (Ian Martin)
+    #What is the Expected Return on the Market
+    #https://academic.oup.com/qje/article/132/1/367/2724543
+    #slides:
+    #https://personal.lse.ac.uk/martiniw/WIER%20slides.pdf
+#CBOE VIX
+    #Volatility Index® Methodology:Cboe Volatility Index® :
+    #https://cdn.cboe.com/api/global/us_indices/governance/Volatility_Index_Methodology_Cboe_Volatility_Index.pdf
+    #Cboe Volatility Index® Mathematics Methodology:
+    #https://cdn.cboe.com/api/global/us_indices/governance/Cboe_Volatility_Index_Mathematics_Methodology.pdf
+#CBOE SKEW
+    #The CBOE Skew Index - SKEW:
+    #https://cdn.cboe.com/resources/indices/documents/SKEWwhitepaperjan2011.pdf
+
+
+import io
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from math import comb
+import warnings
+import re
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from io import StringIO
+from datetime import timedelta
+import pytz
+import datetime
+import pandas_market_calendars as mcal
+import matplotlib.dates as mdates
+from scipy.interpolate import CubicSpline, interp1d
+import statsmodels.api as sm
+
+
+from wrds_queries import (option_metric_query,
+                              get_fwd_price, 
+                              get_sp500_file,
+                              option_liquidation_query,
+                              option_deltas_query,
+                              quote_uniqueness_aggregation,
+                              )
+
+def get_settle_values():
+    """get values of SPX SET index used to settle S&P Options"""
+    settle_df = pd.read_csv('set-history.csv',header=None)
+    settle_dict={}
+    month_mapping={'January':1,'February':2,'March':3,'April':4,'May':5,'June':6,'July':7,
+                'August':8,'September':9,'October':10,'November':11,'December':12}
+
+    _counter=0
+    for index,row in settle_df.iterrows():
+        if row[0].endswith('Settlement Values'):
+            settle_dict[_counter]={}
+            settle_dict[_counter]['Month']=month_mapping.get(row[0].split()[0])
+            settle_dict[_counter]['Year']=int(row[0].split()[1])
+            #_counter+=1
+        elif row[0].startswith('S&P 500 (SET)'):
+            settle_dict[_counter]['Settlement_Value']=row[1]
+            _counter+=1
+        
+    settle_prices=pd.DataFrame.from_dict(settle_dict,orient='index')
+    settle_prices.loc[len(settle_prices)]={'Month':3,'Year':1998,'Settlement_Value':1089.74}
+    settle_prices.loc[len(settle_prices)]={'Month':2,'Year':1998,'Settlement_Value':1028.28}
+    settle_prices.loc[len(settle_prices)]={'Month':1,'Year':1998,'Settlement_Value':950.73}
+    settle_prices.loc[len(settle_prices)]={'Month':10,'Year':1999,'Settlement_Value':1267.13}
+    settle_prices['Settlement_Value']=settle_prices['Settlement_Value'].apply(lambda x:float(re.sub(r'[^0-9.]', '', x)) if type(x)==str else x )
+    settle_prices#.sort_values(by=['Year','Month'],ascending=[False,False])
+    return settle_prices
+
+
+def get_yc_history():
+    yc_pull=pd.read_csv('treasury_rates/interest_rate_consolidated_2.csv',index_col='Date')
+    maturity_mapping={'1 Mo':30,
+                    '2 Mo':60,
+                    '3 Mo':91,
+                    '4 Mo':121,
+                    '6 Mo':182,
+                    '1 Yr':365,
+                    '2 Yr':730,
+                    '3 Yr':1095,
+                    '5 Yr':1825,
+                    '7 Yr':2555,
+                    '10 Yr':3650,
+                    '20 Yr':7300,
+                    '30 Yr':10950}
+    yc_pull.columns=[maturity_mapping.get(col) for col in yc_pull.columns]
+    return yc_pull
+
+
+def find_between(lst, num):
+    """Find the two numbers in a sorted list surrounding a given value."""
+    lst = sorted(lst)
+    for i in range(len(lst) - 1):
+        if lst[i] <= num <= lst[i + 1]:
+            return lst[i], lst[i + 1]
+    return None
+
+
+yc_pull=get_yc_history()
+
+def calculate_interest_rates(current_date,t):
+    """interpolate the interest rate using the cubic spline method in the CBOE white paper"""
+    
+    yc_yday=yc_pull.loc[yc_pull.index < str(current_date.date()) ].iloc[0]
+    yc_yday.dropna(inplace=True) #some dates have missing interest rate data for certain maturities, so we drop those rows to avoid errors in the interpolation
+    intvl=find_between(list(yc_yday.keys()), t) 
+    if intvl: #use the cubic spline interpolation method to find the interest rate for the given days to expiration
+        try:
+            BEY=CubicSpline(list(intvl),[yc_yday[i] for i in intvl],
+                            bc_type='natural',extrapolate=True )(t,0)
+            APY=(1+BEY/2)**2-1
+            r=np.log(1+APY)
+        except:
+            #problem no interest rate for 120 days, use 182 instead if 121 not avail
+            yc_yday=yc_yday.dropna()
+            intvl=find_between(list(yc_yday.keys()), t)
+            BEY=CubicSpline(list(intvl),[yc_yday[i] for i in intvl],
+                bc_type='natural',extrapolate=True )(t,0)
+            APY=(1+BEY/2)**2-1
+            r=np.log(1+APY)
+
+    elif t<min(yc_yday.index): #days to expiration is less than the minimum maturity in the yield curve data, use linear extrapolation
+        t_1,CMT_1=yc_yday.index[0],yc_yday.iloc[0]
+        t_x,CMT_x=yc_yday.index[1],yc_yday.iloc[1]
+        m_low=(CMT_x-CMT_1)/(t_x-t_1)
+        b_low=CMT_1-m_low*t_1
+        m_up=0
+        b_up=CMT_1+m_up*t_1
+        BEY=CubicSpline([t_1,t_x],
+                        [b_low,b_up],bc_type='natural',extrapolate=True )(t,0)
+        APY=(1+BEY/2)**2-1
+        r=np.log(1+APY)
+    
+    return r
+
+#def calculate_interest_rates(current_date, t):
+#    """Interpolate the interest rate using the CBOE cubic spline methodology."""
+#    yc_pull = get_yc_history()
+#    yc_yday = yc_pull.loc[yc_pull.index < str(current_date.date())].iloc[0]
+#    yc_yday = yc_yday.dropna()
+#    if yc_yday.empty:
+#        raise ValueError('No treasury yield curve data available for the requested date')
+#
+#    x = np.array(sorted(yc_yday.index))
+#    y = np.array([yc_yday[i] for i in x])
+#    cs = CubicSpline(x, y, bc_type='natural', extrapolate=True)
+#    BEY = cs(t)
+#    APY = (1 + BEY / 2) ** 2 - 1
+#    return np.log(1 + APY)
+
+
+def compute_realized_variance(returns):
+    returns = pd.Series(returns, dtype=float).fillna(0.0)
+    return (returns ** 2).sum()
+
+
+def compute_dynamic_vix2_hedge(spot_frame, trade_date, maturity_date, r):
+    """Compute the SAS-style daily rebalanced hedge payoff for a VIX^2 claim."""
+    hedge_df = spot_frame.copy()
+    hedge_df = hedge_df.rename(columns={'Index Price - Close Daily': 'S'}) if 'Index Price - Close Daily' in hedge_df.columns else hedge_df
+    hedge_df = hedge_df.rename(columns={'Close': 'S'}) if 'Close' in hedge_df.columns else hedge_df
+    if 'S' not in hedge_df.columns:
+        raise KeyError('Expected a spot-price column named S or Close')
+
+    hedge_df = hedge_df[['date', 'S']].copy() if 'date' in hedge_df.columns else hedge_df[['Date', 'S']].copy()
+    hedge_df.columns = ['date', 'S']
+    hedge_df['date'] = pd.to_datetime(hedge_df['date'])
+    hedge_df = hedge_df.sort_values('date').reset_index(drop=True)
+    hedge_df['stock_ret'] = hedge_df['S'].pct_change().fillna(0.0)
+
+    trade_date = pd.Timestamp(trade_date)
+    maturity_date = pd.Timestamp(maturity_date)
+    #hedge_df['days_elapsed'] = (hedge_df['date'] - trade_date).days
+    hedge_df['days_elapsed'] = (hedge_df['date'] - trade_date).dt.days
+    hedge_df['days_between'] = hedge_df['days_elapsed'].diff().fillna(hedge_df['days_elapsed'].iloc[0])
+    hedge_df['days_between'] = hedge_df['days_between'].clip(lower=0)
+    hedge_df['rf_daily_term'] = np.exp(r / 365.0) ** hedge_df['days_between']
+    #hedge_df['days_to_maturity'] = (maturity_date - hedge_df['date']).days
+    hedge_df['days_to_maturity'] = (maturity_date - hedge_df['date']).dt.days
+    hedge_df['discount_factor'] = np.exp(r * hedge_df['days_to_maturity'] / 365.0)
+    hedge_df['hedge_reinv'] = 2.0 * (1.0 + hedge_df['stock_ret'] - hedge_df['rf_daily_term']) * hedge_df['discount_factor']
+    return float(hedge_df['hedge_reinv'].sum())
+
+
+def compute_sas_vix2_components(opt_portfolio, forward_price, spot_start, spot_end, r, t):
+    """Compute the VIX^2 price/payoff and dynamic hedge return using the SAS formulas."""
+    opt_portfolio = opt_portfolio.sort_values('strike_price').copy()
+    opt_portfolio['lagged_strike_price'] = opt_portfolio['strike_price'].shift(1)
+    opt_portfolio['lead_strike_price'] = opt_portfolio['strike_price'].shift(-1)
+    opt_portfolio['delta_K'] = (opt_portfolio['lead_strike_price'] - opt_portfolio['lagged_strike_price']) / 2.0
+    opt_portfolio.iloc[0, opt_portfolio.columns.get_loc('delta_K')] = opt_portfolio.iloc[0]['lead_strike_price'] - opt_portfolio.iloc[0]['strike_price']
+    opt_portfolio.iloc[-1, opt_portfolio.columns.get_loc('delta_K')] = opt_portfolio.iloc[-1]['strike_price'] - opt_portfolio.iloc[-1]['lagged_strike_price']
+
+    K0 = opt_portfolio[opt_portfolio['strike_price'] <= forward_price]['strike_price'].max()
+    K1 = opt_portfolio[opt_portfolio['strike_price'] > forward_price]['strike_price'].min()
+
+    opt_portfolio['VIX_weight'] = 2.0 * opt_portfolio['delta_K'] / (opt_portfolio['strike_price'] ** 2)
+    mask_k0 = opt_portfolio['strike_price'] == K0
+    mask_k1 = opt_portfolio['strike_price'] == K1
+    if mask_k0.any():
+        delta_k0 = float(opt_portfolio.loc[mask_k0, 'delta_K'].iloc[0])
+        opt_portfolio.loc[mask_k0, 'VIX_weight'] += (K1 - K0 - delta_k0) / (3.0 * (K0 ** 2))
+    if mask_k1.any():
+        delta_k1 = float(opt_portfolio.loc[mask_k1, 'delta_K'].iloc[0])
+        opt_portfolio.loc[mask_k1, 'VIX_weight'] += (K1 - K0 - delta_k1) / (3.0 * (K1 ** 2))
+
+    option_component = (opt_portfolio['VIX_weight'] * opt_portfolio['midpoint_price']).sum()
+    option_payoff_component = (opt_portfolio['VIX_weight'] * opt_portfolio['payoff']).sum()
+    Rf = np.exp(r * t)
+
+    static_term_1 = ((K1 - K0) / 3.0) * (1.0 / (K0 ** 2) - 1.0 / (K1 ** 2)) + (2.0 / forward_price - 1.0 / K0 - 1.0 / K1)
+    static_term_2 = ((K1 - K0) / 3.0) * (1.0 / K1 - 1.0 / K0) + (np.log(forward_price / K0) + np.log(forward_price / K1))
+
+    price = option_component + static_term_1 * spot_start + static_term_2 / Rf
+    payoff = option_payoff_component + static_term_1 * spot_end + static_term_2
+    return price, payoff, opt_portfolio
+
+
+def compute_option_portfolios(num_periods_wanted=3,lb_year=1998,ub_year=2023,ticker='SPX'):
+
+    """form option option portfolios, measure payoffs at maturity and dynamically delta hedge intermintently"""
+    warnings.simplefilter(action='ignore', category=FutureWarning)
+    #approx_period_days=[30*i for i in range(1,num_periods_wanted+1)] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    approx_period_days=[30,60,90]
+    option_portfolios=[]
+    id_counter=1
+
+    #daily values of the underlying spot price for delta hedging
+    sp500_df=get_sp500_file()
+    sp500_df.dropna(subset=['Index Value - Total Return'],inplace=True)
+    sp500_df=sp500_df[['Date','Index Value - Total Return','Index Price - Close Daily']]
+    sp500_df['Index Return']=sp500_df['Index Value - Total Return']/sp500_df['Index Value - Total Return'].shift()-1
+
+    #settlement prices to compute payoffs on options
+    settle_prices=get_settle_values()
+
+    #lb_year=1998 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    #ub_year=2023 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    portfolio_dict={}
+    id_counter=1
+    for yr in range(lb_year,ub_year+1):
+        print(f'{yr} file')
+        #Pull option universe (stored by year)
+        df = option_metric_query(ticker,yr,day=None,month=None)
+        df2=df.copy()
+        lb='1996-01-04'
+        ub='2040-12-31'
+        #CBOE Holidays and Early Closes
+        #   NOTE: need to come back to early closes
+        cboe=mcal.get_calendar('CBOE_Index_Options')
+        cboe_holidays=cboe.holidays()
+        cboe_holidaylist=pd.to_datetime(cboe_holidays.holidays)
+        fridays = list( pd.date_range(lb, ub,freq='W-FRI', tz='US/Eastern',normalize=True).values )
+        third_fridays = list( pd.date_range(lb, ub,freq='WOM-3FRI', tz='US/Eastern',normalize=True).values )
+        fridays=pd.to_datetime(fridays).normalize()
+        third_fridays=pd.to_datetime(third_fridays).normalize()
+        diffed_fridays=list(set(fridays)-set(third_fridays))
+        holiday_dict={}
+        third_friday_holidays=list(set(third_fridays) & set(cboe_holidaylist))
+        expir_not_third_friday=set(pd.to_datetime(df2.exdate.unique()).normalize())-set(third_fridays)
+        for expir in expir_not_third_friday:
+            for holiday in third_friday_holidays:
+                if (holiday-expir).days==1:
+                    holiday_dict[expir]=True
+
+        df2['holiday_exp']=df2['exdate'].map(holiday_dict)
+        df2.fillna({'holiday_exp':False},inplace=True)
+        #Compute time to expiration
+        df3=df2.copy()    
+        df3['datetime_close']=df3['date']+pd.Timedelta(hours=16,minutes=15)
+        df3['ex_time']=df3['exdate']+pd.Timedelta(hours=9,minutes=30)
+        df3['time_to_exp']=df3['ex_time']-df3['datetime_close']
+        #Merge forward price
+        df_fwd=get_fwd_price(ticker,yr)
+        df4=df3.merge(df_fwd,how='left',left_on=['secid','date','exdate'],right_on=['secid','date','expiration'])
+        #df4[pd.isnull(df4.forwardprice)] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        
+
+        #Compute midquote price for each option
+        df4['midpoint_price']=(df4.best_bid+df4.best_offer)/2
+        
+        #Find earliest date to form portfolios on
+            #it is not always the third friday since longer term options arent listed yet.
+            #we call this new date the modified trade date
+        
+        #find unique expirations in the file
+        expirs_wanted=[ i[0] for i in df4.groupby([df4.exdate.dt.year,df4.exdate.dt.month])[['exdate']].min().values ]
+        #for expir in sorted(df4.exdate.unique()): #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        for expir in expirs_wanted:
+            slice_=df4[df4.date==expir]
+            modified_trade_date=expir
+            expir_days=sorted( df4[df4.exdate.isin(expirs_wanted)][df4[df4.exdate.isin(expirs_wanted)].exdate>expir].exdate.unique() ) 
+            #find expirations that are closest to 30,60,90 days respectively
+                #put them in a list expirs_found (expirations found that we wanted)
+            expirs_found=[]
+            for d in approx_period_days:
+                #for e in expir_days: #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                if bool([(i-expir).days for i in expir_days]):
+                    closest_dte=min( [(i-expir).days for i in expir_days], key=lambda x:abs(x-d))
+                    idx=[(i-expir).days for i in expir_days].index(closest_dte)
+                    expirs_found.append(expir_days[idx])
+
+            #logic: find closest date to third friday that all options price on
+            print(f'expirations found: {expirs_found}')
+            trade_date_cands=[]
+            for e in expirs_found:
+                sub_slice_=df4[df4.exdate==e]
+                trade_date_cands.append( min(sub_slice_.date.unique(), key=lambda x: abs(expir - x)) )
+
+            if bool(trade_date_cands):
+                modified_trade_date=max(trade_date_cands)
+                print(f'mod trade date: {modified_trade_date}')
+                #slice_=df4[df4.date>=modified_trade_date] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                slice_=df4[df4.date==modified_trade_date]
+
+                #third friday
+                portfolio_dict[id_counter]={'Trade Date':expir}
+                #the day we actually trade/form the portfolios
+                portfolio_dict[id_counter]['modified_trade_date']=modified_trade_date
+
+                slice_temp=df4[df4.date>=modified_trade_date]
+                #if not slice_[slice_.date>modified_trade_date].empty: #this was for when the year in the date was beyond the yr #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                if not slice_temp[slice_temp.date>modified_trade_date].empty: #this is a fix
+                    #for term in expirs_found: #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                    for i,term in enumerate(expirs_found):
+                        #iterate through each expiration (1 month, 2 month, etc...) and form option portfolios and other objectives
+                        #portfolio_dict[expir][f'{i+1} month expiration']=term #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month expiration']=term
+                        term_df=slice_[(slice_.exdate==term)]
+                        
+                        ###FOR TESTING###
+                        #if term==pd.Timestamp('2023-01-20 00:00:00'):
+                        #    term_df.to_csv('test_file_1.csv')
+                        #################
+
+                        #if term==pd.Timestamp('2004-08-21 00:00:00'):
+                        #    display(slice_[(slice_.exdate==term)])
+
+                        #filter out options with prices that don't make sense
+                        ATM_strike_cands=term_df[~( (pd.isnull(term_df.best_bid)) | (pd.isnull(term_df.best_offer)) ) 
+                                    & ~(term_df.best_bid>term_df.best_offer) 
+                                    & ~(term_df.best_bid<=0)   ]
+                        
+                        mins_in_year=365*24*60
+                        mins_to_expir=ATM_strike_cands.time_to_exp.iloc[0].total_seconds()/60
+                        #time to expiration in years
+                        t=mins_to_expir/mins_in_year
+                        days_to_exp=ATM_strike_cands.iloc[0].time_to_exp.days
+                        #compute interest rate using the date of trade (modified_trade_date) and time to expiration
+                        r=calculate_interest_rates(modified_trade_date,ATM_strike_cands.iloc[0].time_to_exp.days)
+                        ert=np.exp(r*t)
+                        ert_min=np.exp(-r*t)
+
+                        def min_strike_diff(slice):
+                            if ('C' in slice.cp_flag.unique()) and ('P' in slice.cp_flag.unique()):
+                                return abs( slice[slice.cp_flag=='P'].midpoint_price.values[0] - slice[slice.cp_flag=='C'].midpoint_price.values[0])
+                        #The CBOE VIX white paper defines the forwad price to the strike at which the call and put price are minimized
+                        F_strike=ATM_strike_cands.groupby(['strike_price']).apply(min_strike_diff).idxmin()
+                        call_put_diff=ATM_strike_cands[(ATM_strike_cands.strike_price==F_strike)].sort_values(by='cp_flag')['midpoint_price'].diff().dropna().values[0]
+                        F=F_strike+np.exp(r*t)*call_put_diff
+                        #...and K0 to be the strike just below the F. This is where we split the intergration between calls and puts
+                        K0=term_df[term_df.strike_price<=F].strike_price.max()
+                        #look for out of the money (OOM) puts and calls
+                            #exclude nonpositive bid prices
+                            #orient the dataframe so that OOM puts are in the top rows and puts in the bottom rows
+                        
+                        #doing rectangle VIX
+                        F=df_fwd[(df_fwd['expiration']==term)
+                                &(df_fwd['date']==modified_trade_date)]['forwardprice'].iloc[0]
+
+                        def filter_included_options(opt_type):
+                            if opt_type=='put':
+                                OOM_opts=term_df[(term_df.strike_price<F)&(term_df.cp_flag=='P')]
+                                OOM_opts=OOM_opts.copy()
+                                #OOM_opts.sort_values(by=['strike_price'],ascending=False,inplace=True) #sort upside down for puts #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                                OOM_opts['excl_ind']=OOM_opts.best_bid.apply(lambda x: pd.isnull(x) or x<=0)
+                                OOM_opts.sort_values(by=['strike_price'],ascending=False,inplace=True) #sort upside down for puts
+                            else:
+                                OOM_opts=term_df[(term_df.strike_price>F)&(term_df.cp_flag=='C')]
+                                OOM_opts=OOM_opts.copy()
+                                #trying sort this time
+                                OOM_opts.sort_values(by=['strike_price'],ascending=True,inplace=True) #sort upside down for puts
+                                OOM_opts['excl_ind']=OOM_opts.best_bid.apply(lambda x: pd.isnull(x) or x<=0)
+                                #dont need to change sorting order for calls
+
+                            OOM_opts['excl_ind']=OOM_opts['excl_ind'].cumsum()
+                            #stop including options once you hit two non positive quotes
+                            incl_opts=OOM_opts[OOM_opts.excl_ind<2]
+                            incl_opts=incl_opts[incl_opts.best_bid>0]
+                            if opt_type=='put':
+                                incl_opts.sort_values(by=['strike_price'],ascending=True,inplace=True)#change back
+                            return incl_opts
+
+                        incl_puts,incl_calls=filter_included_options('put'),filter_included_options('call')
+
+                        df_K0=term_df[term_df.strike_price==K0]
+                        #at the at-the-money level, the portfolio owns both a put and call option
+                        pca=pd.DataFrame.from_dict({'strike_price':K0,
+                                                    'cp_flag':'P/C Avg', #put-call average
+                                                    'midpoint_price':term_df[(term_df.strike_price==K0)]['midpoint_price'].mean(),
+                                                    'best_bid':None,
+                                                    'best_offer':None,
+                                                    'optionid':None,
+                                                    'delta':term_df[(term_df.strike_price==K0)]['delta'].sum(), #deltas are linear
+                                                    'forwardprice':term_df[(term_df.strike_price==K0)]['forwardprice'].unique()[0]},
+                                                    orient='index').T
+                        #opt_portfolio is the dataframe with the OOM options
+                            #it consists of puts, calls and an avg of the ATM put and call
+                        opt_portfolio=pd.concat([incl_puts,pca,incl_calls])[['strike_price',
+                                                                            'cp_flag',
+                                                                            'midpoint_price',
+                                                                            'best_bid','best_offer',
+                                                                            'optionid',
+                                                                            'delta',
+                                                                            'forwardprice']]
+
+                        #adding this to try and fix the negative dK issue
+                        opt_portfolio.sort_values(by=['strike_price'],ascending=True,inplace=True)
+                        #dK as the difference between adjacent strikes as defined in the CBOE VIX white paper
+                        opt_portfolio['dK']=(opt_portfolio.strike_price.shift(-1)-opt_portfolio.strike_price.shift(1))/2
+                        opt_portfolio=opt_portfolio.copy()
+                        #opt_portfolio.iloc[0]['dK']=opt_portfolio.iloc[1]['strike_price']-opt_portfolio.iloc[0]['strike_price'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #opt_portfolio.iloc[-1]['dK']=opt_portfolio.iloc[-1]['strike_price']-opt_portfolio.iloc[-2]['strike_price'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        opt_portfolio.iloc[0,-1]=opt_portfolio.iloc[1]['strike_price']-opt_portfolio.iloc[0]['strike_price']
+                        opt_portfolio.iloc[-1,-1]=opt_portfolio.iloc[-1]['strike_price']-opt_portfolio.iloc[-2]['strike_price']
+                        
+                        #block of code to compute payoffs on options in the portfolio
+                        settle_value=float(settle_prices[(settle_prices['Month']==term.month) & (settle_prices['Year']==term.year)]['Settlement_Value'].values[0])
+                        def call_payoff(s,k):
+                            return max(s-k,0)
+                        def put_payoff(s,k):
+                            return max(k-s,0)
+                        def option_payoff(row):
+                            k=row['strike_price']
+                            opt_type=row['cp_flag']
+                            if opt_type=='C':
+                                return call_payoff(settle_value,k) 
+                            elif opt_type=='P':
+                                return put_payoff(settle_value,k)
+                            else:
+                                return call_payoff(settle_value,k)+put_payoff(settle_value,k)
+
+                        opt_portfolio['payoff']=opt_portfolio.apply(option_payoff,axis=1)
+
+                        #Delta Hedging and Realized Moments
+                        hedge_df = sp500_df[(sp500_df.Date >= modified_trade_date) & (sp500_df.Date < term)].copy()
+                        hedge_df = hedge_df.rename(columns={'Index Price - Close Daily': 'S'})
+                        hedge_df['Date'] = pd.to_datetime(hedge_df['Date'])
+                        hedge_df = hedge_df.sort_values('Date').reset_index(drop=True)
+                        #hedge_df['Index Return'] = hedge_df['S'].pct_change().fillna(0.0)
+                        #equal_ssr = compute_realized_variance(hedge_df['Index Return'])
+                        # FIX 3: hedge_df previously stopped at the close the day before expiration (Date < term),
+                        # so neither equal_ssr nor the delta-hedge sum below ever saw the close-to-open move into
+                        # the settle_value (SET) print that opt_portfolio['payoff'] is already computed from --
+                        # SPX index options are AM-settled, so that move is a real, priced return leg, not a gap
+                        # to skip (see settle_value at line 430, used for the option payoffs). Append it as one
+                        # synthetic row dated on `term` with S=settle_value; pct_change() then picks up
+                        # settle_value/S_{close,T-1}-1 as the final leg automatically, both here and inside
+                        # compute_dynamic_vix2_hedge below (same hedge_df is reused there).
+                        settlement_row = pd.DataFrame({'Date': [term], 'S': [settle_value]})
+                        hedge_df = pd.concat([hedge_df, settlement_row], ignore_index=True)
+                        hedge_df['Index Return'] = hedge_df['S'].pct_change().fillna(0.0)
+                        equal_ssr = compute_realized_variance(hedge_df['Index Return'])
+
+                        #VIX and VIX^2 using the SAS-style weight construction
+                        """
+                        spot_start=float(hedge_df.iloc[0]['S'])
+                        spot_end=float(settle_value)
+                        vix_square_price, vix_square_payoff, opt_portfolio = compute_sas_vix2_components(
+                            opt_portfolio,
+                            forward_price=F,
+                            spot_start=spot_start,
+                            spot_end=spot_end,
+                            r=float(r),
+                            t=float(t),
+                        )
+                        opt_portfolio['VIX_opt_weight'] = opt_portfolio['VIX_weight']
+                        """
+                        
+                        VIX_opt_weight=opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        #VIX_opt_weight*=2/t*ert
+                        VIX_opt_weight*=2*ert
+                        opt_portfolio['VIX_opt_weight']=VIX_opt_weight
+                        opt_portfolio['VIX_square_opt_weight']=VIX_opt_weight
+                        vix_square=(opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum()
+                        # FIX 2: vix_square_payoff used to reuse VIX_opt_weight, which carries the `ert`
+                        # (e^{rT}) forward-value factor. That factor exists to forward-value TODAY's option
+                        # price so it's consistent with using the forward F; it has no business multiplying
+                        # a payoff that already occurs at expiration T (SAS's Option_TerminalPayoff never
+                        # applies Rf either, see Code_Index_Simpson_Return.sas line 233). Use a payoff weight
+                        # without the ert factor instead.
+                        vix_square_payoff=(opt_portfolio.VIX_opt_weight*opt_portfolio.payoff).sum()
+                        vix_square_payoff*=ert_min
+                        #VIX_opt_weight_payoff=opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        #VIX_opt_weight_payoff*=2/t
+                        #opt_portfolio['VIX_opt_weight_payoff']=VIX_opt_weight_payoff
+                        #vix_square_payoff=(opt_portfolio.VIX_opt_weight_payoff*opt_portfolio.payoff).sum()
+                        vix_square_price=vix_square/ert
+
+
+                        portfolio_dict[id_counter][f'{i+1} month VIX']=np.sqrt((opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum())*100
+                        #portfolio_dict[id_counter][f'{i+1} month VIX payoff']=np.sqrt((opt_portfolio.VIX_opt_weight*opt_portfolio.payoff).sum())*100
+                        #FIX 2 (same ert leak as vix_square_payoff above, applied to the displayed "VIX payoff" metric)
+                        portfolio_dict[id_counter][f'{i+1} month VIX payoff']=np.sqrt((opt_portfolio.VIX_opt_weight*opt_portfolio.payoff).sum())*100
+                        opt_portfolio['VIX_bid_contribtion']=opt_portfolio.apply(lambda x: x.VIX_opt_weight*x.best_bid if x.VIX_opt_weight >0 else x.VIX_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['VIX_ask_contribtion']=opt_portfolio.apply(lambda x: x.VIX_opt_weight*x.best_offer if x.VIX_opt_weight >0 else x.VIX_opt_weight*x.best_bid,axis=1)
+                        #vix_square_bid=np.exp(r*t)*opt_portfolio['VIX_bid_contribtion'].sum()
+                        #vix_square_ask=np.exp(r*t)*opt_portfolio['VIX_ask_contribtion'].sum()
+                        vix_square_bid=opt_portfolio['VIX_bid_contribtion'].sum()
+                        vix_square_ask=opt_portfolio['VIX_ask_contribtion'].sum()
+                        vix_square_spread=vix_square_ask-vix_square_bid
+
+                        #OLD CODE
+                        #opt_portfolio['VIX_square_opt_weight']=opt_portfolio['VIX_weight']
+                        
+                        opt_portfolio['VIX_opt_weight']=VIX_opt_weight
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2']=vix_square
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 price']=vix_square_price
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 payoff']=vix_square_payoff
+                        opt_portfolio['VIX_square_bid_contribtion']=opt_portfolio.apply(lambda x: x.VIX_square_opt_weight*x.best_bid if x.VIX_square_opt_weight >0 else x.VIX_square_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['VIX_square_ask_contribtion']=opt_portfolio.apply(lambda x: x.VIX_square_opt_weight*x.best_offer if x.VIX_square_opt_weight >0 else x.VIX_square_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month VIX square bid']=vix_square_bid
+                        portfolio_dict[id_counter][f'{i+1} month VIX square ask']=vix_square_ask
+                        portfolio_dict[id_counter][f'{i+1} month VIX square spread ($)']=vix_square_spread
+
+                        #Delta Hedging and Realized Moments
+                        vix_square_delta_hedge_payoff = compute_dynamic_vix2_hedge(
+                                                    hedge_df[['Date', 'S']],
+                                                    modified_trade_date,
+                                                    term,
+                                                    r,
+                                                )
+                        hedge_adjust=-2*( settle_value/hedge_df.iloc[0]['S']/ert-1 )
+                        dynamic_vix2_payoff = vix_square_payoff - 2.0 * ((settle_value / hedge_df.iloc[0]['S']/ert ) - 1.0) + vix_square_delta_hedge_payoff
+                            # FIX 1: vix_square_payoff is annualized (it carries the 2/t factor baked into
+                            # VIX_opt_weight_payoff), but hedge_adjust and vix_square_delta_hedge_payoff are
+                            # ported straight from the SAS code (Code_Index_Simpson_Return.sas), which works
+                            # entirely in raw, non-annualized, T-period units (its Weight_eachoption has no /T).
+                            # Combining an annualized term with two raw terms is a unit mismatch whose severity
+                            # scales with 1/t, i.e. differently across the 30/60/90-day maturities. Scale the
+                            # raw legs by the same (2/t) annualization factor baked into vix_square_payoff (and
+                            # into vix_square_price, the denominator these are compared against) so all three
+                            # legs of dynamic_vix2_payoff are in consistent units.
+                        #annualization_factor = 2/t
+                        #dynamic_vix2_payoff = vix_square_payoff + hedge_adjust*annualization_factor + vix_square_delta_hedge_payoff*annualization_factor
+
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']=vix_square_delta_hedge_payoff
+                        portfolio_dict[id_counter][f'Realized Variance {i+1}-month (SSR)']=equal_ssr
+                        portfolio_dict[id_counter][f'Realized Variance {i+1}-month (SSR_Fwd)']=np.nan
+                        portfolio_dict[id_counter][f'Realized Variance {i+1}-month (SSR_Fut)']=np.nan
+                        portfolio_dict[id_counter][f'Realized Variance {i+1}-month (SSR) Reconcile']=np.nan
+                        portfolio_dict[id_counter][f'Realized Variance {i+1}-month (SSR) Reconcile_2']=np.nan
+
+                        #Returns and Payoffs
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 return (%)']=(vix_square_payoff/vix_square_price-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedged return(%)']=(dynamic_vix2_payoff/vix_square_price-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Payoff w/ Delta Hedging($)']=dynamic_vix2_payoff
+                        #portfolio_dict[id_counter][f'{i+1}-month Realized Variance Return (%)']=((equal_ssr/t)/vix_square_price-1)*100
+                        portfolio_dict[id_counter][f'{i+1}-month Realized Variance Return (%)']=((equal_ssr)/vix_square_price-1)*100
+                        portfolio_dict[id_counter][f'{i+1}-month austin_static_hedge']=hedge_adjust
+                        
+                    
+                        #misc things to add to option portfolios
+                        maturity_id=i+1
+                        opt_portfolio['portfolio_id']=id_counter
+                        opt_portfolio['maturity_id']=maturity_id
+                        opt_portfolio['trade_date']=expir
+                        opt_portfolio['modified_trade_date']=modified_trade_date
+                        opt_portfolio['F']=F
+                        opt_portfolio['r']=r
+                        opt_portfolio['S_T']=settle_value
+                        opt_portfolio['t']=t
+
+                        #countin number of options and range of moneyness
+                        portfolio_dict[id_counter][f'{i+1} month number of options']=opt_portfolio.shape[0]+1
+                        portfolio_dict[id_counter][f'{i+1} month max moneyness']=opt_portfolio.strike_price.max()/F
+                        portfolio_dict[id_counter][f'{i+1} month min moneyness']=opt_portfolio.strike_price.min()/F
+                        portfolio_dict[id_counter][f'{i+1} month market gross return']=settle_value/F
+                        portfolio_dict[id_counter][f'{i+1} month F']=F
+                        portfolio_dict[id_counter][f'{i+1} month S_T']=settle_value
+                        portfolio_dict[id_counter][f'{i+1} month interest rate']=r
+                        portfolio_dict[id_counter][f'{i+1} month t']=t
+                        
+
+
+                        ###########FOR DOUBLE CHECK###########
+                        #######################################
+
+
+                        
+                        """
+                        if i+1==3:
+                            liquidation_date=expirs_found[i-1]
+                            #print(f'{i} month liquidation_date:{liquidation_date}') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print('--------------------') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.optionid.size) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print( len(set(opt_portfolio_2.optionid.values.tolist())) ) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            liquidation_values=option_liquidation_query(ticker,
+                                                                        opt_portfolio_2.optionid.dropna().values.tolist(),
+                                                                        liquidation_date)
+                            opt_portfolio_2=opt_portfolio_2.merge(liquidation_values,how='left',on=['optionid'])
+                            opt_portfolio_2.rename(columns={'liquidation_midprice_date':f'{i+1}M port liquidation_midprice_date'},inplace=True)
+                            #display(opt_portfolio_2[pd.isnull(opt_portfolio_2[f'{i+1}M port liquidation_midprice_date'])]) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            vix_square_liquidation_value=(t*opt_portfolio_2.VIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month VIX^2 liquidation']=vix_square_liquidation_value
+                            gvix_square_liquidation_value=(t*opt_portfolio_2.GVIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month GVIX^2 liquidation']=gvix_square_liquidation_value
+
+                        elif i+1==2:
+                            #pass
+                            liquidation_date=expirs_found[i-1]
+                            #print(f'{i} month liquidation_date:{liquidation_date}') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print('--------------------') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.optionid.size) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print( len(set(opt_portfolio_2.optionid.values.tolist())) ) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            liquidation_values=option_liquidation_query(ticker,
+                                                opt_portfolio_2.optionid.dropna().values.tolist(),
+                                                liquidation_date)
+                    
+                            opt_portfolio_2=opt_portfolio_2.merge(liquidation_values,how='left',on=['optionid'])
+                            opt_portfolio_2.rename(columns={'liquidation_midprice_date':f'{i+1}M port liquidation_midprice_date'},inplace=True)
+                            #display(opt_portfolio_2[pd.isnull(opt_portfolio_2[f'{i+1}M port liquidation_midprice_date'])]) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            vix_square_liquidation_value=(t*opt_portfolio_2.VIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month VIX^2 liquidation']=vix_square_liquidation_value
+                            gvix_square_liquidation_value=(t*opt_portfolio_2.GVIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month GVIX^2 liquidation']=gvix_square_liquidation_value
+                        """
+
+                        ###########FOR DOUBLE CHECK###########
+                        #opt_portfolio['interest_factor']=np.exp(r*t)
+                        #opt_portfolio['S_T']=settle_value
+                        """
+                        if expir==pd.Timestamp('2023-06-16 00:00:00'):
+                            opt_portfolio_2.to_csv(f'{i+1}month_option_portfolio_2_{expir}.csv')
+                        if expir==pd.Timestamp('2023-08-18 00:00:00'):
+                            opt_portfolio_2.to_csv(f'{i+1}month_option_portfolio_2_{expir}.csv')
+                        """
+                        #######################################
+
+
+                        option_portfolios.append(opt_portfolio)
+                        #option_portfolios.append(opt_portfolio_2)
+
+                        #print(6/0)
+
+                        
+
+
+                    id_counter+=1            
+
+            
+            #next_expir = pd.Series(slice_.exdate.unique()).nsmallest(3)
+            #portfolio_dict[id_counter]={'Trade Date':expir}
+            #portfolio_dict[id_counter]['modified_trade_date']=modified_trade_date
+
+            #print('----------------------------------')
+    
+    option_portfolios_df=pd.concat(option_portfolios)
+
+    monthly_portfolios=pd.DataFrame.from_dict(portfolio_dict).T.dropna(subset=['1 month expiration'])
+    monthly_portfolios=monthly_portfolios[monthly_portfolios['Trade Date']<monthly_portfolios['1 month expiration']]
+    monthly_portfolios['1 month DTE']=monthly_portfolios['1 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['2 month DTE']=monthly_portfolios['2 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['3 month DTE']=monthly_portfolios['3 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['1 month DTE']=monthly_portfolios['1 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['2 month DTE']=monthly_portfolios['2 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['3 month DTE']=monthly_portfolios['3 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['Trade Date']=pd.to_datetime(monthly_portfolios['Trade Date'])
+    monthly_portfolios['modified_trade_date']=pd.to_datetime(monthly_portfolios['modified_trade_date'])#.dt.date
+    monthly_portfolios['1 month expiration']=pd.to_datetime(monthly_portfolios['1 month expiration'])#.dt.date
+    monthly_portfolios['2 month expiration']=pd.to_datetime(monthly_portfolios['2 month expiration'])#.dt.date
+    monthly_portfolios['3 month expiration']=pd.to_datetime(monthly_portfolios['3 month expiration'])#.dt.date
+    warnings.resetwarnings()
+    #return portfolio_dict, option_portfolios
+    return monthly_portfolios, option_portfolios_df
+
+
+
+def comparison_against_vix(monthly_portfolios):
+
+    path='https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
+    vix_hist=pd.read_csv(path,index_col='DATE')
+    vix_hist.index = pd.to_datetime(vix_hist.index)
+    vix_hist.index = vix_hist.index.strftime('%Y-%m-%d')
+    vix_hist.reset_index(inplace=True)
+    vix_hist['DATE']=pd.to_datetime(vix_hist['DATE']).dt.date
+
+    x=monthly_portfolios[['modified_trade_date','1 month VIX']]
+    #x=monthly_portfolios[monthly_portfolios['Trade Date'].dt.year>=2015][['modified_trade_date','1 month VIX']]
+    x=x.copy()
+    x['modified_trade_date']=x['modified_trade_date'].dt.date
+    comb=x.merge(vix_hist,
+            how='left',
+            left_on=['modified_trade_date'],
+            right_on=['DATE'])
+
+    comb.rename(columns={'CLOSE':'CBOE VIX','1 month VIX':'1 month VIX replicate'},inplace=True)
+    comb[['1 month VIX replicate','CBOE VIX']].corr().to_csv('hedged_vix_returns/outputs/vix_replicate_correlation.csv')    
+    comb['1 month VIX replicate']=comb['1 month VIX replicate'].astype(float)
+    summ_stats=comb[['1 month VIX replicate','CBOE VIX']].describe()
+    summ_stats.loc['skew']=summ_stats.skew()
+    summ_stats.loc['kurt']=summ_stats.kurt()
+    summ_stats.to_csv('hedged_vix_returns/outputs/vix_replicate_summary_stats.csv')
+    plt.figure(figsize=(10, 6))
+    plt.title('CBOE VIX vs Replicated VIX')
+    plt.plot(comb['modified_trade_date'],comb['1 month VIX replicate'],label='computed')
+    plt.plot(comb['modified_trade_date'],comb['CBOE VIX'],label='actual',alpha=0.6)
+    plt.legend()
+    #plt.show()
+    plt.savefig(f"hedged_vix_returns/outputs/plots/vix_replicate_plot.png", bbox_inches='tight')
+    plt.close()
+
+
+
+def hedged_returns_analysis(monthly_portfolios):
+
+    #comparing different hedging and SSRs
+    x=monthly_portfolios.copy()
+
+    summ_stats_1=x[['Trade Date'
+                    ,'1 month VIX^2 Delta Hedged return(%)',
+                    '1-month Realized Variance Return (%)']]
+    summ_stats_1['1-month Realized Variance Return (%)']#/=12
+    #display(summ_stats_1.iloc[:,1:].corr()*100)
+    summ_stats_1.iloc[:,1:].corr().to_csv('hedged_vix_returns/outputs/VIX_VSR_correlations/hedged_returns_correlation.csv')
+    summ_stats_2=summ_stats_1.copy()
+    for col in summ_stats_2.columns[1:]:
+        summ_stats_2[col]=summ_stats_2[col].astype(float)
+    summ_stats_3=summ_stats_2.iloc[:,1:].describe()
+    #summ_stats_3.loc['skew']=summ_stats_3.skew()
+    #summ_stats_3.loc['kurt']=summ_stats_3.kurt()
+    #display(summ_stats_3)
+    summ_stats_3.to_csv('hedged_vix_returns/outputs/summary_stats/hedged_returns_summary_stats.csv')
+    
+    a=0.7
+    plt.figure(figsize=(10, 6))
+    plt.title('Hedged $VIX^2$ Returns vs Realized Variance Returns')
+    plt.plot(summ_stats_2['Trade Date'],summ_stats_2['1-month Realized Variance Return (%)']/100,label=r'$r^{VSR}$',alpha=a)
+    #plt.plot(summ_stats_2['Trade Date'],summ_stats_2['1-month Realized Variance Return F (%)']/100,label=r'$r^{VSR}$',alpha=a)
+    #plt.plot(summ_stats_2['Trade Date'],summ_stats_2['1-month Realized Variance Return Fut (%)']/100,label=r'$r^{VSR}$',alpha=a)
+    plt.plot(summ_stats_2['Trade Date'],summ_stats_2['1 month VIX^2 Delta Hedged return(%)']/100,label=r'$r^{VIX}$',alpha=a)
+    plt.ylabel('% (3Fri-3Fri)')
+    plt.legend()
+    #plt.show()
+    plt.savefig(f"hedged_vix_returns/outputs/plots/hedged_returns_plot.png", bbox_inches='tight')
+    plt.close()
+
+    #summ_stats_4=x[['Trade Date','Realized Variance 1-month (SSR)','Realized Variance 1-month (SSR_Fwd)','Realized Variance 1-month (SSR_Fut)']]
+    #plt.title('Sum of Squared Daily Returns')
+    #plt.plot(summ_stats_4['Trade Date'],summ_stats_4['Realized Variance 1-month (SSR)'],label=r'Spot',alpha=a)
+    #plt.plot(summ_stats_4['Trade Date'],summ_stats_4['Realized Variance 1-month (SSR_Fwd)'],label=r'Fwd',alpha=a)
+    #plt.plot(summ_stats_4['Trade Date'],summ_stats_4['Realized Variance 1-month (SSR_Fut)'],label=r'Fut',alpha=a)
+    #plt.ylim(None,0.03)
+    #plt.ylabel('SSR')
+    #plt.xlabel('Date')
+    #plt.legend()
+    #plt.show()
+
+    
+def hedged_returns_analysis_multihorizon(monthly_portfolios):
+
+    x=monthly_portfolios.copy()
+    for i in range(1,3+1):
+        summ_stats_1=x[['Trade Date',
+                    f'{i} month VIX^2 Delta Hedged return(%)',
+                    f'{i}-month Realized Variance Return (%)',]]
+        #display(summ_stats_1.iloc[:,1:].corr()*100)
+        summ_stats_1.iloc[:,1:].corr().to_csv(f'hedged_vix_returns/outputs/VIX_VSR_correlations/hedged_returns_correlation_{i}month.csv')
+        summ_stats_2=summ_stats_1.copy()
+        for col in summ_stats_2.columns[1:]:
+            summ_stats_2[col]=summ_stats_2[col].astype(float)
+        summ_stats_3=summ_stats_2.iloc[:,1:].describe()
+        #display(summ_stats_3)
+        summ_stats_3.to_csv(f'hedged_vix_returns/outputs/summary_stats/hedged_returns_summary_stats_{i}month.csv')
+
+
+def shuaiqi_results_comparison(monthly_portfolios):
+
+    shuaiqi_df=pd.read_sas('index_simpson_return.sas7bdat')#.columns
+    shuaiqi_df[['Dynamic_VIX_Return','VSR']].corr().to_csv('hedged_vix_returns/shuaiqi_correlation.csv')
+
+    x=monthly_portfolios.copy()
+    x['modified_trade_date']=pd.to_datetime(x['modified_trade_date'])
+    x2=x.merge(shuaiqi_df,how='inner',
+            left_on=[x.modified_trade_date.dt.year,x.modified_trade_date.dt.month],
+            right_on=[shuaiqi_df.date.dt.year,shuaiqi_df.date.dt.month])
+
+    shuaiqi_df.columns
+
+    x2=x2[x2.modified_trade_date.dt.year>=2000]
+
+    x2['1 month VIX^2 return (%)']/=100
+    x2['1-month Realized Variance Return (%)']/=100
+    x2['1 month VIX^2 Delta Hedged return(%)']/=100
+
+    x2['shuaiqi_static_hedge']=-2*(x2.St_end/x2.St_start/(1+x2.Rf)-1)
+
+
+    col_mapping={'VIX^2 Price':['1 month VIX^2','VIX_Prc'],
+                'VIX^2 Payoff':['1 month VIX^2 payoff','Static_VIX_Payoff'],
+                #'VIX^2 Payoff':['1 month VIX^2 Return (%)','Static_VIX_Return'],
+                'Delta Hedge Payoff':['1 month VIX^2 Delta Hedging Payoff','Delta_Hedge_payoff'],
+                'Static Hedge Component':['1-month austin_static_hedge','shuaiqi_static_hedge'],
+                'Realized Variance':['Realized Variance 1-month (SSR)','Monthly_RV'],
+                'Unhedged VIX^2 return':['1 month VIX^2 return (%)','Static_VIX_Return'],
+                'VSR (variance swap return)':[f'1-month Realized Variance Return (%)','VSR'],
+                'VIX^2 Payoff w Delta Hedging':['1 month VIX^2 Payoff w/ Delta Hedging($)','Dynamic_VIX_Payoff'],
+                'Hedged VIX^2 Return':['1 month VIX^2 Delta Hedged return(%)','Dynamic_VIX_Return'],
+                'Terminal Stock Price':['1 month S_T','St_end'],
+                    'Forward Value':['1 month F','forward']
+                }
+    a=0.6
+    #x2=x2[['modified_trade_date','1 month VIX^2','VIX_Prc']]
+    with PdfPages('hedged_vix_returns/outputs/shuaiqi_comparison/shuaqi_compare.pdf') as pdf:
+        for k,v in col_mapping.items():
+                x3=x2[['modified_trade_date',v[0],v[1]]]
+                x3=x3.copy()
+                x3[v[0]]=x3[v[0]].astype(float)
+                x3[v[1]]=x3[v[1]].astype(float)
+                #x2.rename(columns={'1 month VIX^2':'AustinVIX^2','VIX_Prc':'Shuaiqi_VIX^2'},inplace=True)
+                print(k)
+                #display( x3.iloc[:,1:].corr() )
+                x3.iloc[:,:].corr().to_csv(f'hedged_vix_returns/outputs/shuaiqi_comparison/correlations/shuaiqi_comparison_{k}.csv')
+                fig, ax = plt.subplots(figsize=(6, 2))
+                ax.axis('tight'); ax.axis('off')
+                plot_df=x3.iloc[:,1:].corr()
+                ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close()
+                #display( x3.iloc[:,1:].describe().round(6) )
+                x3.iloc[1:,:].describe().round(6).to_csv(f'hedged_vix_returns/outputs/shuaiqi_comparison/summary_stats/shuaiqi_comparison_{k}.csv')
+                fig, ax = plt.subplots(figsize=(6, 2))
+                ax.axis('tight'); ax.axis('off')
+                plot_df=x3.iloc[1:,:].describe().round(6)
+                ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close()
+
+                plt.figure(figsize=(10, 6))
+                plt.plot(x3.modified_trade_date,x3[v[0]],alpha=a,label='Austin')
+                plt.plot(x3.modified_trade_date,x3[v[1]],alpha=a,label='Shuaiqi')
+                plt.title(rf'{k}')
+                plt.legend()
+                #plt.show()
+                plt.savefig(f"hedged_vix_returns/outputs/shuaiqi_comparison/plots/shuaiqi_comparison_{k}.png", bbox_inches='tight')
+                pdf.savefig(bbox_inches='tight')
+                plt.close()
+
+
+##############
+
+def check_quote_uniqueness(tick,lb_year,ub_year):
+    df = quote_uniqueness_aggregation(tick,lb_year,ub_year)
+    print('Query Done')
+    df.to_csv('expectations_hypothesis_testing/outputs/quote_uniqueness_aggregation.csv')
+
+
+
+##############
+
+def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
+
+    regression_stats={}
+    variance_measures=['VIX^2']
+    if cutoff_year:
+        output_filename = f'outputs/expectation_hpothesis/regression_summaries_post{cutoff_year}.txt'
+    else:
+        output_filename = 'outputs/expectation_hpothesis/regression_summaries.txt'
+    with open(output_filename, 'w') as fh:
+            for k in range(1,2+1):
+                    #print(f'{k} month')
+                    regression_stats[k]={}
+                    for v in variance_measures:
+                            #print(v)
+
+                            data=monthly_portfolios[['Trade Date',f'1 month {v}',f'2 month {v}',f'3 month {v}',
+                                            f'2 month {v} liquidation',f'3 month {v} liquidation',
+                                            f'1 month {v} payoff',f'2 month {v} payoff',f'3 month {v} payoff',
+                                            f'{3} month number of options',f'{2} month number of options',f'{1} month number of options',
+                                            f'{3} month market gross return',f'{2} month market gross return',f'{1} month market gross return',
+                                            f'{3} month max moneyness',f'{2} month max moneyness',f'{1} month max moneyness',
+                                            f'{3} month min moneyness',f'{2} month min moneyness',f'{1} month min moneyness']]
+
+                            if cutoff_year:
+                                data=data[data['Trade Date'].dt.year>=cutoff_year]
+                            #august and september
+                            #data=data[(data['Trade Date']>=pd.Timestamp('2008-08-01 00:00:00'))]
+                            #data=data[data['Trade Date'].dt.year>=2008]
+                            #data=data[~data['Trade Date'].dt.year.isin([2008,1998])]
+
+                            data=data.copy()
+                            data['VAR(t+k)']=data[f'1 month {v}'].shift(-k).astype(float)
+                            data['VAR(t)']=data[f'1 month {v}'].shift(0).astype(float)
+                            data['FVAR(t,t+k+1)']=(data[f'{k+1} month {v}']-data[f'{k} month {v}']).astype(float)
+                            data['H']=data['FVAR(t,t+k+1)']-data['VAR(t+k)']
+                            data['H_discrete']=data[f'{k+1} month {v} liquidation']-data[f'{k} month {v} payoff']-(data[f'{k+1} month {v}']-data[f'{k} month {v}'])
+                            data['H_discrete']=data['H_discrete'].astype(float)
+                            data['H_discrete']*=-1
+
+                            #data['H']=data['FVAR(t,t+k+1)']-(data['VAR(t+k)']-data['VAR(t)'])
+                            data['FVAR(t,t+k+1) - VAR(t+k)']=data['FVAR(t,t+k+1)']-data['VAR(t+k)']
+                            #data['-(VAR(t+k)-VAR(t))']=-(data['VAR(t+k)']-data['VAR(t)'])
+                            data.dropna(inplace=True)
+                            #display(data)
+
+                            ###################################
+                            #data=data[~data['Trade Date'].dt.year.isin([2008])]
+
+                            fh.write(f"--- {v} {k+1} Month Regression ---\n")
+                            fh.write(f"---- Continuous HPR Version ----\n")
+                            fh.write(f"----- Primal Regression -----\n")
+                            #Primal: VAR(t+k)-VAR(t) = a + b(FVAR(t,t+k+1)-VAR(t)) + e(t+k)
+                            #"""
+                            y=data['VAR(t+k)']-data['VAR(t)']
+                            x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
+                            ols_model = sm.OLS(y, x)
+                            primal_ols_results= ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
+                            #print('primal')
+                            #print(primal_ols_results.params['const'])
+                            #print(primal_ols_results.params[0])
+                            #print(primal_ols_results.resid.mean())
+                            #print( primal_ols_results.summary() )
+                            #"""
+                            fh.write(primal_ols_results.summary().as_text())
+                            fh.write("\n\n")
+
+                            #Dual: 
+                            fh.write(f"--- Dual Regression ---\n")
+                            #"""
+                            y=data['H']
+                            x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
+                            ols_model = sm.OLS(y, x)
+                            dual_ols_results = ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
+                            #print('dual')
+                            #print(dual_ols_results.params['const'])
+                            #print(dual_ols_results.params[0])
+                            #print(dual_ols_results.resid.mean())
+                            #print( dual_ols_results.summary() )
+                            #"""
+                            fh.write(dual_ols_results.summary().as_text())
+                            fh.write("\n\n")
+
+                            data['alpha_primal']=primal_ols_results.params['const']
+                            data['beta_primal']=primal_ols_results.params[0]
+                            data['Avg(e)_primal']=primal_ols_results.resid.mean()
+                            data['alpha_dual']=dual_ols_results.params['const']
+                            data['beta_dual']=dual_ols_results.params[0]
+                            data['Avg(e)_dual']=dual_ols_results.resid.mean()
+                            data['sum(a)']=primal_ols_results.params['const']+dual_ols_results.params['const']
+                            data['sum(B)-1']=primal_ols_results.params[0]+dual_ols_results.params[0]-1
+                            #display(data)
+                            #print('Summary')
+                            #print('sum(a)')
+                            #print(primal_ols_results.params['const']+dual_ols_results.params['const'])
+                            #print('sum(B)-1')
+                            #print(primal_ols_results.params[0]+dual_ols_results.params[0]-1)
+
+                            
+
+                            regression_stats[k][v]={}
+
+                            regression_stats[k][v]['continuous']={'⍺_primal_coef':primal_ols_results.params['const'],
+                                            '⍺_primal_Tstat':primal_ols_results.tvalues['const'],
+                                            'β_primal_coef':primal_ols_results.params[0],
+                                            'β_primal_Tstat':primal_ols_results.tvalues[0],
+                                            'R^2_primal':primal_ols_results.rsquared,
+                                            '⍺_dual_coef':dual_ols_results.params['const'],
+                                            '⍺_dual_Tstat':dual_ols_results.tvalues['const'],
+                                            'β_dual_coef':dual_ols_results.params[0],
+                                            'β_dual_Tstat':dual_ols_results.tvalues[0],
+                                            'R^2_dual':dual_ols_results.rsquared,
+                                            'sum(⍺)':primal_ols_results.params['const']+dual_ols_results.params['const'],
+                                            'sum(β)-1':primal_ols_results.params[0]+dual_ols_results.params[0]-1,
+                                            'sum(β)':primal_ols_results.params[0]+dual_ols_results.params[0],
+                                            }
+                            #print('-------------------------')
+
+                            #print('Discrete Version')
+                            fh.write(f"---- Dicrete HPR Version ----\n")
+                            fh.write(f"----- Dual Regression -----\n")
+
+                            y=data['H_discrete']
+                            x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
+                            ols_model = sm.OLS(y, x)
+                            dual_ols_results = ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
+                            fh.write(dual_ols_results.summary().as_text())
+                            fh.write("\n\n")
+
+                            #print('dual')
+                            #print(dual_ols_results.params['const'])
+                            #print(dual_ols_results.params[0])
+                            #print(dual_ols_results.resid.mean())
+                            #print( dual_ols_results.summary() )
+                            #"""
+                            data['alpha_primal']=primal_ols_results.params['const']
+                            data['beta_primal']=primal_ols_results.params[0]
+                            data['Avg(e)_primal']=primal_ols_results.resid.mean()
+                            data['alpha_dual']=dual_ols_results.params['const']
+                            data['beta_dual']=dual_ols_results.params[0]
+                            data['Avg(e)_dual']=dual_ols_results.resid.mean()
+                            data['sum(a)']=primal_ols_results.params['const']+dual_ols_results.params['const']
+                            data['sum(B)-1']=primal_ols_results.params[0]+dual_ols_results.params[0]-1
+                            #display(data)
+                            #print('Summary')
+                            #print('sum(a)')
+                            #print(primal_ols_results.params['const']+dual_ols_results.params['const'])
+                            #print('sum(B)-1')
+                            #print(primal_ols_results.params[0]+dual_ols_results.params[0]-1)
+
+
+                            regression_stats[k][v]['discrete']={'⍺_primal_coef':primal_ols_results.params['const'],
+                                                    '⍺_primal_Tstat':primal_ols_results.tvalues['const'],
+                                                    'β_primal_coef':primal_ols_results.params[0],
+                                                    'β_primal_Tstat':primal_ols_results.tvalues[0],
+                                                    'R^2_primal':primal_ols_results.rsquared,
+                                                    '⍺_dual_coef':dual_ols_results.params['const'],
+                                                    '⍺_dual_Tstat':dual_ols_results.tvalues['const'],
+                                                    'β_dual_coef':dual_ols_results.params[0],
+                                                    'β_dual_Tstat':dual_ols_results.tvalues[0],
+                                                    'R^2_dual':dual_ols_results.rsquared,
+                                                    'sum(⍺)':primal_ols_results.params['const']+dual_ols_results.params['const'],
+                                                    'sum(β)-1':primal_ols_results.params[0]+dual_ols_results.params[0]-1,
+                                                    'sum(β)':primal_ols_results.params[0]+dual_ols_results.params[0],
+                                                    }
+                            
+                            #separata regression
+
+                            #print('------------------------------------')
+
+
+
+
+
+    #var_regression_df=pd.DataFrame.from_dict({(i,j): regression_stats[i][j] 
+    #                            for i in regression_stats.keys() 
+    #                            for j in regression_stats[i].keys()},
+    #                            orient='index')
+    var_regression_df=pd.DataFrame.from_dict({(i,j,k): regression_stats[i][j][k] 
+                                for i in regression_stats.keys() 
+                                for j in regression_stats[i].keys()
+                                for k in regression_stats[i][j].keys()},
+                                orient='index')
+    var_regression_df.index.names=['Months From Now','Var. Measure','Version']
+    if cutoff_year:
+        var_regression_df.to_csv(f'outputs/expectation_hpothesis/variance_expecthypoth_results_post{cutoff_year}.csv')
+    else:
+        var_regression_df.to_csv('outputs/expectation_hpothesis/variance_expecthypoth_results.csv')
+
+    #var_regression_df#.iloc[:,-3:]
+
+
+############################################################
+#################### LEGACY CODE BELOW ########################
+#################### NOT TO BE RUN; NOT TO BE MODIFIEF ########################
+############################################################
+
+
+def compute_option_portfolios_OLD(num_periods_wanted=3,lb_year=1998,ub_year=2023,ticker='SPX'):
+    """form option option portfolios, measure payoffs at maturity and dynamically delta hedge intermintently"""
+    
+    warnings.simplefilter(action='ignore', category=FutureWarning)
+    #num_periods_wanted=3 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    #approx_period_days=[30*i for i in range(1,num_periods_wanted+1)] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    approx_period_days=[30,60,90]
+    option_portfolios=[]
+    id_counter=1
+    #daily values of the underlying spot price for delta hedging
+    sp500_df=get_sp500_file()
+    sp500_df.dropna(subset=['Index Value - Total Return'],inplace=True)
+    sp500_df=sp500_df[['Date','Index Value - Total Return','Index Price - Close Daily']]
+    sp500_df['Index Return']=sp500_df['Index Value - Total Return']/sp500_df['Index Value - Total Return'].shift()-1
+    #settlement prices to compute payoffs on options
+    settle_prices=get_settle_values()
+
+    #lb_year=1998 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    #ub_year=2023 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    portfolio_dict={}
+    #portfolio_df=pd.DataFrame() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+    id_counter=1
+    for yr in range(lb_year,ub_year+1):
+        print(f'{yr} file')
+        #Pull option universe (stored by year)
+        df = option_metric_query(ticker,yr,day=None,month=None)
+        df2=df.copy()
+        lb='1996-01-04'
+        ub='2040-12-31'
+        #CBOE Holidays and Early Closes
+        #   NOTE: need to come back to early closes
+        cboe=mcal.get_calendar('CBOE_Index_Options')
+        cboe_holidays=cboe.holidays()
+        cboe_holidaylist=pd.to_datetime(cboe_holidays.holidays)
+        fridays = list( pd.date_range(lb, ub,freq='W-FRI', tz='US/Eastern',normalize=True).values )
+        third_fridays = list( pd.date_range(lb, ub,freq='WOM-3FRI', tz='US/Eastern',normalize=True).values )
+        fridays=pd.to_datetime(fridays).normalize()
+        third_fridays=pd.to_datetime(third_fridays).normalize()
+        diffed_fridays=list(set(fridays)-set(third_fridays))
+        holiday_dict={}
+        third_friday_holidays=list(set(third_fridays) & set(cboe_holidaylist))
+        expir_not_third_friday=set(pd.to_datetime(df2.exdate.unique()).normalize())-set(third_fridays)
+        for expir in expir_not_third_friday:
+            for holiday in third_friday_holidays:
+                if (holiday-expir).days==1:
+                    holiday_dict[expir]=True
+
+        df2['holiday_exp']=df2['exdate'].map(holiday_dict)
+        df2.fillna({'holiday_exp':False},inplace=True)
+        #Compute time to expiration
+        df3=df2.copy()    
+        df3['datetime_close']=df3['date']+pd.Timedelta(hours=16,minutes=15)
+        df3['ex_time']=df3['exdate']+pd.Timedelta(hours=9,minutes=30)
+        df3['time_to_exp']=df3['ex_time']-df3['datetime_close']
+        #Merge forward price
+        df_fwd=get_fwd_price(ticker,yr)
+        df4=df3.merge(df_fwd,how='left',left_on=['secid','date','exdate'],right_on=['secid','date','expiration'])
+        #df4[pd.isnull(df4.forwardprice)] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        #df4['OOM']=df4.apply(lambda x:True if ((x.cp_flag=='C' and x.strike_price>=x.forwardprice) or (x.cp_flag=='P' and x.strike_price<=x.forwardprice)) else False ) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        def oom_indicator(row):
+            if (row.cp_flag=='C' and row.strike_price>=row.forwardprice) or (row.cp_flag=='P' and row.strike_price<=row.forwardprice):
+                return True
+            else:
+                return False
+        #df4['oom']=df4.apply(oom_indicator,axis=1) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        df4['midpoint_price']=(df4.best_bid+df4.best_offer)/2
+        
+        #Find earliest date to form portfolios on
+            #it is not always the third friday since longer term options arent listed yet.
+            #we call this new date the modified trade date
+        
+        #find unique expirations in the file
+        expirs_wanted=[ i[0] for i in df4.groupby([df4.exdate.dt.year,df4.exdate.dt.month])[['exdate']].min().values ]
+        #for expir in sorted(df4.exdate.unique()): #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+        for expir in expirs_wanted:
+            slice_=df4[df4.date==expir]
+            modified_trade_date=expir
+            expir_days=sorted( df4[df4.exdate.isin(expirs_wanted)][df4[df4.exdate.isin(expirs_wanted)].exdate>expir].exdate.unique() ) 
+            #find expirations that are closest to 30,60,90 days respectively
+                #put them in a list expirs_found (expirations found that we wanted)
+            expirs_found=[]
+            for d in approx_period_days:
+                #for e in expir_days: #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                if bool([(i-expir).days for i in expir_days]):
+                    closest_dte=min( [(i-expir).days for i in expir_days], key=lambda x:abs(x-d))
+                    idx=[(i-expir).days for i in expir_days].index(closest_dte)
+                    expirs_found.append(expir_days[idx])
+
+            #logic: find closest date to third friday that all options price on
+            trade_date_cands=[]
+            for e in expirs_found:
+                sub_slice_=df4[df4.exdate==e]
+                trade_date_cands.append( min(sub_slice_.date.unique(), key=lambda x: abs(expir - x)) )
+
+            if bool(trade_date_cands):
+                modified_trade_date=max(trade_date_cands)
+                #slice_=df4[df4.date>=modified_trade_date] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                slice_=df4[df4.date==modified_trade_date]
+
+                #third friday
+                portfolio_dict[id_counter]={'Trade Date':expir}
+                #the day we actually trade/form the portfolios
+                portfolio_dict[id_counter]['modified_trade_date']=modified_trade_date
+
+                slice_temp=df4[df4.date>=modified_trade_date]
+                #if not slice_[slice_.date>modified_trade_date].empty: #this was for when the year in the date was beyond the yr #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                if not slice_temp[slice_temp.date>modified_trade_date].empty: #this is a fix
+                    #for term in expirs_found: #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                    for i,term in enumerate(expirs_found):
+                        #iterate through each expiration (1 month, 2 month, etc...) and form option portfolios and other objectives
+                        #portfolio_dict[expir][f'{i+1} month expiration']=term #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month expiration']=term
+                        term_df=slice_[(slice_.exdate==term)]
+                        
+                        ###FOR TESTING###
+                        #if term==pd.Timestamp('2023-01-20 00:00:00'):
+                        #    term_df.to_csv('test_file_1.csv')
+                        #################
+
+                        #if term==pd.Timestamp('2004-08-21 00:00:00'):
+                        #    display(slice_[(slice_.exdate==term)])
+
+                        #filter out options with prices that don't make sense
+                        ATM_strike_cands=term_df[~( (pd.isnull(term_df.best_bid)) | (pd.isnull(term_df.best_offer)) ) 
+                                    & ~(term_df.best_bid>term_df.best_offer) 
+                                    & ~(term_df.best_bid<=0)   ]
+                        
+                        mins_in_year=365*24*60
+                        mins_to_expir=ATM_strike_cands.time_to_exp.iloc[0].total_seconds()/60
+                        #time to expiration in years
+                        t=mins_to_expir/mins_in_year
+                        days_to_exp=ATM_strike_cands.iloc[0].time_to_exp.days
+                        #compute interest rate using the date of trade (modified_trade_date) and time to expiration
+                        #r=calculate_interest_rates(expir,ATM_strike_cands.iloc[0].time_to_exp.days) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        r=calculate_interest_rates(modified_trade_date,ATM_strike_cands.iloc[0].time_to_exp.days)
+                        #missing data in yield curve fiel was throwing error
+
+                        def min_strike_diff(slice):
+                            if ('C' in slice.cp_flag.unique()) and ('P' in slice.cp_flag.unique()):
+                                return abs( slice[slice.cp_flag=='P'].midpoint_price.values[0] - slice[slice.cp_flag=='C'].midpoint_price.values[0])
+                        #The CBOE VIX white paper defines the forwad price to the strike at which the call and put price are minimized
+                        F_strike=ATM_strike_cands.groupby(['strike_price']).apply(min_strike_diff).idxmin()
+                        call_put_diff=ATM_strike_cands[(ATM_strike_cands.strike_price==F_strike)].sort_values(by='cp_flag')['midpoint_price'].diff().dropna().values[0]
+                        F=F_strike+np.exp(r*t)*call_put_diff
+                        #...and K0 to be the strike just below the F. This is where we split the intergration between calls and puts
+                        K0=term_df[term_df.strike_price<=F].strike_price.max()
+                        #look for out of the money (OOM) puts and calls
+                            #exclude nonpositive bid prices
+                            #orient the dataframe so that OOM puts are in the top rows and puts in the bottom rows
+                        def filter_included_options(opt_type):
+                            if opt_type=='put':
+                                OOM_opts=term_df[(term_df.strike_price<K0)&(term_df.cp_flag=='P')]
+                                OOM_opts=OOM_opts.copy()
+                                #OOM_opts.sort_values(by=['strike_price'],ascending=False,inplace=True) #sort upside down for puts #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                                OOM_opts['excl_ind']=OOM_opts.best_bid.apply(lambda x: pd.isnull(x) or x<=0)
+                                OOM_opts.sort_values(by=['strike_price'],ascending=False,inplace=True) #sort upside down for puts
+                            else:
+                                OOM_opts=term_df[(term_df.strike_price>K0)&(term_df.cp_flag=='C')]
+                                OOM_opts=OOM_opts.copy()
+                                #trying sort this time
+                                OOM_opts.sort_values(by=['strike_price'],ascending=True,inplace=True) #sort upside down for puts
+                                OOM_opts['excl_ind']=OOM_opts.best_bid.apply(lambda x: pd.isnull(x) or x<=0)
+                                #dont need to change sorting order for calls
+
+                            OOM_opts['excl_ind']=OOM_opts['excl_ind'].cumsum()
+                            #stop including options once you hit two non positive quotes
+                            incl_opts=OOM_opts[OOM_opts.excl_ind<2]
+                            incl_opts=incl_opts[incl_opts.best_bid>0]
+                            if opt_type=='put':
+                                incl_opts.sort_values(by=['strike_price'],ascending=True,inplace=True)#change back
+                            return incl_opts
+
+                        incl_puts,incl_calls=filter_included_options('put'),filter_included_options('call')
+
+                        df_K0=term_df[term_df.strike_price==K0]
+                        #at the at-the-money level, the portfolio owns both a put and call option
+                        pca=pd.DataFrame.from_dict({'strike_price':K0,
+                                                    'cp_flag':'P/C Avg', #put-call average
+                                                    'midpoint_price':term_df[(term_df.strike_price==K0)]['midpoint_price'].mean(),
+                                                    'best_bid':None,
+                                                    'best_offer':None,
+                                                    'optionid':None,
+                                                    'delta':term_df[(term_df.strike_price==K0)]['delta'].sum(), #deltas are linear
+                                                    'forwardprice':term_df[(term_df.strike_price==K0)]['forwardprice'].unique()[0]},
+                                                    orient='index').T
+                        #opt_portfolio is the dataframe with the OOM options
+                            #it consists of puts, calls and an avg of the ATM put and call
+                        opt_portfolio=pd.concat([incl_puts,pca,incl_calls])[['strike_price',
+                                                                            'cp_flag',
+                                                                            'midpoint_price',
+                                                                            'best_bid','best_offer',
+                                                                            'optionid',
+                                                                            'delta',
+                                                                            'forwardprice']]
+
+                        #adding this to try and fix the negative dK issue
+                        opt_portfolio.sort_values(by=['strike_price'],ascending=True,inplace=True)
+                        #dK as the difference between adjacent strikes as defined in the CBOE VIX white paper
+                        opt_portfolio['dK']=(opt_portfolio.strike_price.shift(-1)-opt_portfolio.strike_price.shift(1))/2
+                        opt_portfolio=opt_portfolio.copy()
+                        #opt_portfolio.iloc[0]['dK']=opt_portfolio.iloc[1]['strike_price']-opt_portfolio.iloc[0]['strike_price'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #opt_portfolio.iloc[-1]['dK']=opt_portfolio.iloc[-1]['strike_price']-opt_portfolio.iloc[-2]['strike_price'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        opt_portfolio.iloc[0,-1]=opt_portfolio.iloc[1]['strike_price']-opt_portfolio.iloc[0]['strike_price']
+                        opt_portfolio.iloc[-1,-1]=opt_portfolio.iloc[-1]['strike_price']-opt_portfolio.iloc[-2]['strike_price']
+                        
+                        #block of code to compute payoffs on options in the portfolio
+                        settle_value=float(settle_prices[(settle_prices['Month']==term.month) & (settle_prices['Year']==term.year)]['Settlement_Value'].values[0])
+                        def call_payoff(s,k):
+                            return max(s-k,0)
+                        def put_payoff(s,k):
+                            return max(k-s,0)
+                        def option_payoff(row):
+                            k=row['strike_price']
+                            opt_type=row['cp_flag']
+                            if opt_type=='C':
+                                return call_payoff(settle_value,k) 
+                            elif opt_type=='P':
+                                return put_payoff(settle_value,k)
+                            else:
+                                return call_payoff(settle_value,k)+put_payoff(settle_value,k)
+
+                        opt_portfolio['payoff']=opt_portfolio.apply(option_payoff,axis=1)
+
+                        #now that we have the universe of OOM options, we can start forming options portfolios to replicate the indexes
+                            #such as VIX, SKEW, and Ian Martin's SVIX
+                        #scaling by 2/t for now instead of 2
+                        #CBOE VIX option weights are 2/t * dK/K^2
+                        VIX_opt_weight=(2/t)*opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        SVIX_opt_weight=(2/t)*opt_portfolio.dK/(F**2)
+                        GVIX_opt_weight=(2/t)*opt_portfolio.dK/(F*opt_portfolio.strike_price)
+                        #VIX_opt_weight=2*opt_portfolio.dK/(opt_portfolio.strike_price**2) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #SVIX_opt_weight=2*opt_portfolio.dK/(F**2) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        # CBOE SKEW power portfolio weights
+                        p1_option_weight=-opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        p2_option_weight=2*opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        p2_option_weight*=1-np.log(opt_portfolio.strike_price.astype(np.float64)/F)
+                        p3_option_weight=3*opt_portfolio.dK/(opt_portfolio.strike_price**2)
+                        p3_option_weight*=2*np.log(opt_portfolio.strike_price.astype(np.float64)/F)-np.log(opt_portfolio.strike_price.astype(np.float64)/F)**2
+
+                        e1=-(1+np.log(F/K0)-(F/K0))
+                        e2=2*np.log(K0/F)*(F/K0-1)+(1/2)*np.log(K0/F)**2
+                        e3=3*np.log(K0/F)**2 * (1/3*np.log(K0/F)-1+F/K0)
+                        P1=( np.exp(r*t)*(opt_portfolio.midpoint_price*p1_option_weight) ).sum()
+                        P1+=e1
+                        P2=( np.exp(r*t)*(opt_portfolio.midpoint_price*p2_option_weight) ).sum()
+                        P2+=e2
+                        P3=( np.exp(r*t)*(opt_portfolio.midpoint_price*p3_option_weight) ).sum()
+                        P3+=e3
+                        sigma=np.sqrt(P2-P1**2)
+                        
+                        #VIX and VIX^2
+                        opt_portfolio['VIX_opt_weight']=VIX_opt_weight#*np.exp(r*t)
+                        #CBOE VIX index approximation
+                        portfolio_dict[id_counter][f'{i+1} month VIX']=np.sqrt(np.exp(r*t)*(opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum())*100
+                        #portfolio_dict[id_counter][f'{i+1} month VIX']=np.sqrt((opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum())*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month VIX payoff']=np.sqrt((opt_portfolio.VIX_opt_weight*opt_portfolio.payoff).sum())*100
+                        opt_portfolio['VIX_bid_contribtion']=opt_portfolio.apply(lambda x: x.VIX_opt_weight*x.best_bid if x.VIX_opt_weight >0 else x.VIX_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['VIX_ask_contribtion']=opt_portfolio.apply(lambda x: x.VIX_opt_weight*x.best_offer if x.VIX_opt_weight >0 else x.VIX_opt_weight*x.best_bid,axis=1)
+                        
+                        #multiply by t to get rid of the 2/t factor from earlier
+                        #vix_square is VIX^2; the risk-neutral expected variance
+                        vix_square=(t*opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum()
+                        #the payoff on the portfolio from holding the options to maturity
+                        vix_square_payoff=(t*opt_portfolio.VIX_opt_weight*opt_portfolio.payoff).sum()
+                        opt_portfolio['VIX_square_opt_weight']=VIX_opt_weight*t
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2']=vix_square
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 payoff']=vix_square_payoff
+                        #bid-ask contribution is used to compute the bids and asks on the index estimates
+                            #some option weights aee negative, in which you switch the bid and ask
+                        opt_portfolio['VIX_square_bid_contribtion']=opt_portfolio.apply(lambda x: x.VIX_square_opt_weight*x.best_bid if x.VIX_square_opt_weight >0 else x.VIX_square_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['VIX_square_ask_contribtion']=opt_portfolio.apply(lambda x: x.VIX_square_opt_weight*x.best_offer if x.VIX_square_opt_weight >0 else x.VIX_square_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month VIX square bid']=np.exp(r*t)*opt_portfolio['VIX_square_bid_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month VIX square ask']=np.exp(r*t)*opt_portfolio['VIX_square_ask_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month VIX square spread ($)']=portfolio_dict[id_counter][f'{i+1} month VIX square ask']-portfolio_dict[id_counter][f'{i+1} month VIX square bid']
+
+                        #SVIX and SVIX^2
+                        #This Ian's Martin SVIX from his paper 'what is the expected return on the market'
+                        opt_portfolio['SVIX_opt_weight']=SVIX_opt_weight#*np.exp(r*t)
+                        portfolio_dict[id_counter][f'{i+1} month SVIX']=np.sqrt(np.exp(r*t)*(opt_portfolio.SVIX_opt_weight*opt_portfolio.midpoint_price).sum())*100
+                        #portfolio_dict[id_counter][f'{i+1} month SVIX']=np.sqrt((opt_portfolio.SVIX_opt_weight*opt_portfolio.midpoint_price).sum())*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month SVIX payoff']=np.sqrt((opt_portfolio.SVIX_opt_weight*opt_portfolio.payoff).sum())*100        
+                        opt_portfolio['SVIX_bid_contribtion']=opt_portfolio.apply(lambda x: x.SVIX_opt_weight*x.best_bid if x.SVIX_opt_weight >0 else x.SVIX_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['SVIX_ask_contribtion']=opt_portfolio.apply(lambda x: x.SVIX_opt_weight*x.best_offer if x.SVIX_opt_weight >0 else x.SVIX_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month SVIX bid']=np.sqrt(np.exp(r*t)*opt_portfolio['SVIX_bid_contribtion'].sum())*100
+                        portfolio_dict[id_counter][f'{i+1} month SVIX ask']=np.sqrt(np.exp(r*t)*opt_portfolio['SVIX_ask_contribtion'].sum())*100
+                        portfolio_dict[id_counter][f'{i+1} month SVIX spread ($)']=portfolio_dict[id_counter][f'{i+1} month SVIX ask']-portfolio_dict[id_counter][f'{i+1} month SVIX bid']
+                        #SVIX^2 is variance analog of SVIX
+                        svix_square=(t*opt_portfolio.SVIX_opt_weight*opt_portfolio.midpoint_price).sum()
+                        svix_square_payoff=(t*opt_portfolio.SVIX_opt_weight*opt_portfolio.payoff).sum()
+                        opt_portfolio['SVIX_square_opt_weight']=SVIX_opt_weight*t
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2']=svix_square
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2 payoff']=svix_square_payoff
+                        opt_portfolio['SVIX_square_bid_contribtion']=opt_portfolio.apply(lambda x: x.SVIX_square_opt_weight*x.best_bid if x.SVIX_square_opt_weight >0 else x.SVIX_square_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['SVIX_square_ask_contribtion']=opt_portfolio.apply(lambda x: x.SVIX_square_opt_weight*x.best_offer if x.SVIX_square_opt_weight >0 else x.SVIX_square_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month SVIX square bid']=np.exp(r*t)*opt_portfolio['SVIX_square_bid_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month SVIX square ask']=np.exp(r*t)*opt_portfolio['SVIX_square_ask_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month SVIX square spread ($)']=portfolio_dict[id_counter][f'{i+1} month SVIX square ask']-portfolio_dict[id_counter][f'{i+1} month SVIX square bid']
+
+                        #GVIX and GVIX^2
+                        opt_portfolio['GVIX_opt_weight']=GVIX_opt_weight#*np.exp(r*t)
+                        opt_portfolio['GVIX_square_opt_weight']=t*GVIX_opt_weight
+                        gvix_square=(t*opt_portfolio.GVIX_opt_weight*opt_portfolio.midpoint_price).sum()
+                        gvix_square_payoff=(t*opt_portfolio.GVIX_opt_weight*opt_portfolio.payoff).sum()
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2']=gvix_square
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2 payoff']=gvix_square_payoff
+                        #GVIX^2 is variance analog of GVIX
+                        opt_portfolio['GVIX_square_bid_contribtion']=opt_portfolio.apply(lambda x: x.GVIX_square_opt_weight*x.best_bid if x.GVIX_square_opt_weight >0 else x.GVIX_square_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['GVIX_square_ask_contribtion']=opt_portfolio.apply(lambda x: x.GVIX_square_opt_weight*x.best_offer if x.GVIX_square_opt_weight >0 else x.GVIX_square_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month GVIX square bid']=np.exp(r*t)*opt_portfolio['GVIX_square_bid_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month GVIX square ask']=np.exp(r*t)*opt_portfolio['GVIX_square_ask_contribtion'].sum()
+                        portfolio_dict[id_counter][f'{i+1} month GVIX square spread ($)']=portfolio_dict[id_counter][f'{i+1} month GVIX square ask']-portfolio_dict[id_counter][f'{i+1} month GVIX square bid']
+
+                        #P2
+                        opt_portfolio['P2_opt_weight']=p2_option_weight
+                        p2_payoff=(opt_portfolio.P2_opt_weight*opt_portfolio.payoff).sum()
+                        #p2_option_weight
+                        portfolio_dict[id_counter][f'{i+1} month P2']=P2
+                        portfolio_dict[id_counter][f'{i+1} month P2 payoff']=p2_payoff
+
+                        #CBOE SKEW (method 1)
+                        opt_portfolio['meth1_opt_weight']=(p3_option_weight - 3*P1*p2_option_weight + 2*P1**2*p1_option_weight) * np.exp(r*t)/sigma**3
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW']=100-10*(opt_portfolio.meth1_opt_weight*opt_portfolio.midpoint_price).sum()
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW payoff']=100-10*(opt_portfolio.meth1_opt_weight*opt_portfolio.payoff).sum()
+                        opt_portfolio['meth1_bid_contribtion']=opt_portfolio.apply(lambda x: x.meth1_opt_weight*x.best_bid if x.meth1_opt_weight >0 else x.meth1_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['meth1_ask_contribtion']=opt_portfolio.apply(lambda x: x.meth1_opt_weight*x.best_offer if x.meth1_opt_weight >0 else x.meth1_opt_weight*x.best_bid,axis=1)
+                        #100-10*ask - (100-10*bid) < 0 when ask>bid
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW bid']=100-10*(opt_portfolio['meth1_bid_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW ask']=100-10*(opt_portfolio['meth1_ask_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW spread ($)']=portfolio_dict[id_counter][f'{i+1} month CBOE SKEW ask']-portfolio_dict[id_counter][f'{i+1} month CBOE SKEW bid']
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW spread ($)']*=-1
+                        #portfolio_dict[id_counter][f'{i+1} month CBOE SKEW bid']=opt_portfolio['meth1_bid_contribtion'].sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i+1} month CBOE SKEW ask']=opt_portfolio['meth1_ask_contribtion'].sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i+1} month CBOE SKEW spread ($)']=100-10*((opt_portfolio['meth1_ask_contribtion']-opt_portfolio['meth1_bid_contribtion']).sum()) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+
+                        #Method 2 SKEW
+                        opt_portfolio['meth2_opt_weight']=(-6*p1_option_weight - 3*p2_option_weight) * np.exp(r*t)/sigma**3
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2']=100-10*(opt_portfolio.meth2_opt_weight*opt_portfolio.midpoint_price).sum()
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 payoff']=100-10*(opt_portfolio.meth2_opt_weight*opt_portfolio.payoff).sum()
+                        opt_portfolio['meth2_bid_contribtion']=opt_portfolio.apply(lambda x: x.meth2_opt_weight*x.best_bid if x.meth2_opt_weight >0 else x.meth2_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['meth2_ask_contribtion']=opt_portfolio.apply(lambda x: x.meth2_opt_weight*x.best_offer if x.meth2_opt_weight >0 else x.meth2_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 bid']=100-10*(opt_portfolio['meth2_bid_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 ask']=100-10*(opt_portfolio['meth2_ask_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 spread ($)']=portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 ask']-portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 bid']
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 spread ($)']*=-1
+                        #portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 spread ($)']=100-10*((opt_portfolio['meth2_ask_contribtion']-opt_portfolio['meth2_bid_contribtion']).sum()) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+
+                        #SSKEW (Method 3)
+                        opt_portfolio['meth3_opt_weight']=(SVIX_opt_weight-VIX_opt_weight) * 3/2*np.exp(r*t)/sigma**3
+                        opt_portfolio['meth3_opt_weight']=(opt_portfolio['SVIX_square_opt_weight']-opt_portfolio['VIX_square_opt_weight']) * 3/2*np.exp(r*t)/sigma**3
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW']=100-10*( (3/2)*np.exp(r*t)/(sigma**3)*(svix_square-vix_square) )
+                        #portfolio_dict[id_counter][f'{i+1} month SSKEW']=100-10*(opt_portfolio.meth3_opt_weight*opt_portfolio.midpoint_price).sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW payoff']=100-10*( (3/2)/(sigma**3)*(svix_square_payoff-vix_square_payoff) )
+                        opt_portfolio['meth3_bid_contribtion']=opt_portfolio.apply(lambda x: x.meth3_opt_weight*x.best_bid if x.meth3_opt_weight >0 else x.meth3_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['meth3_ask_contribtion']=opt_portfolio.apply(lambda x: x.meth3_opt_weight*x.best_offer if x.meth3_opt_weight >0 else x.meth3_opt_weight*x.best_bid,axis=1)
+                        #portfolio_dict[id_counter][f'{i+1} month SSKEW bid']=(3/2)*np.exp(r*t)/(sigma**3)*(portfolio_dict[id_counter][f'{i+1} month SVIX square bid']-portfolio_dict[id_counter][f'{i+1} month VIX square bid']) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i+1} month SSKEW ask']=(3/2)*np.exp(r*t)/(sigma**3)*(portfolio_dict[id_counter][f'{i+1} month SVIX square ask']-portfolio_dict[id_counter][f'{i+1} month VIX square ask']) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i+1} month SSKEW spread ($)']=portfolio_dict[id_counter][f'{i+1} month SSKEW ask']-portfolio_dict[id_counter][f'{i+1} month SSKEW bid'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW bid']=100-10*(opt_portfolio['meth3_bid_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW ask']=100-10*(opt_portfolio['meth3_ask_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW spread ($)']=portfolio_dict[id_counter][f'{i+1} month SSKEW ask']-portfolio_dict[id_counter][f'{i+1} month SSKEW bid']
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW spread ($)']*=-1
+
+
+                        #KNS SKEW (Method 4)
+                        kns_skew=3*(gvix_square-vix_square)
+                        
+                        kns_skew_payoff=3*(gvix_square_payoff-vix_square_payoff)
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS']=kns_skew
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS payoff']=kns_skew_payoff
+                        #scaling by sigma
+                        kns_skew/=vix_square**(3/2)
+                        kns_skew=100-10*kns_skew
+                        #scaling for bid_ask spread
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS_scaled']=kns_skew
+
+                        opt_portfolio['SKEW_KNS_opt_weight']=3*(t*opt_portfolio['GVIX_opt_weight']-opt_portfolio['VIX_square_opt_weight']) *np.exp(r*t)
+                        opt_portfolio['SKEW_KNS_opt_weight']/=vix_square**(3/2)
+                        opt_portfolio['SKEW_KNS_bid_contribtion']=opt_portfolio.apply(lambda x: x.SKEW_KNS_opt_weight*x.best_bid if x.SKEW_KNS_opt_weight >0 else x.SKEW_KNS_opt_weight*x.best_offer,axis=1)
+                        opt_portfolio['SKEW_KNS_ask_contribtion']=opt_portfolio.apply(lambda x: x.SKEW_KNS_opt_weight*x.best_offer if x.SKEW_KNS_opt_weight >0 else x.SKEW_KNS_opt_weight*x.best_bid,axis=1)
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS bid']=100-10*(opt_portfolio['SKEW_KNS_bid_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS ask']=100-10*(opt_portfolio['SKEW_KNS_ask_contribtion'].sum())
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS spread ($)']=portfolio_dict[id_counter][f'{i+1} month SKEW_KNS ask']-portfolio_dict[id_counter][f'{i+1} month SKEW_KNS bid']
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS spread ($)']*=-1
+                        
+                        #check sum of deltas vs model-free claim delta
+
+                        #This section is where we delta hedge the option portfolios and compute corresponding weighted realized moments
+
+                        #Delta Hedging and Realized Moments
+
+                        #daily_int_rate=np.exp(r*1/360)-1 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #timeframe over which we want to delta hedge
+                        hedge_df=sp500_df[(sp500_df.Date>=modified_trade_date)&(sp500_df.Date<term)]
+                        hedge_df=hedge_df.copy()
+                        #realized var error: this could be dropping a row no forward on last day
+                        #daily stock return
+                        hedge_df['Index Return']=hedge_df['Index Value - Total Return']/hedge_df['Index Value - Total Return'].shift()-1
+                        #the corresponding weighted realized variance for VIX^2 should be sum of squared daily returns
+                        equal_ssr=(hedge_df['Index Return']**2).sum() #VIX^2
+                        #inner merge is dropping a row here
+                        #hedge_df=hedge_df.merge(df_fwd[df_fwd.expiration==term],left_on=['Date'],right_on=['date'])
+                        #merge forward prices to dataframe
+                        hedge_df=hedge_df.merge(df_fwd[df_fwd.expiration==term],how='left',left_on=['Date'],right_on=['date'])
+                        hedge_df.rename(columns={'forwardprice':'F'},inplace=True)
+                        #underlying spot price used to compute deltas and P&L from hedging
+                        hedge_df.rename(columns={'Index Price - Close Daily':'S'},inplace=True)
+                        #hedge_df.rename(columns={'Index Value - Total Return':'S'},inplace=True
+                        #time to maturity
+                        hedge_df['days_to_maturity']=(term-hedge_df['Date']).dt.days
+                        #years to maturity
+                        tau=hedge_df['days_to_maturity']/360
+                        #hedge_df['weight_gamma']=np.exp(r*tau)*hedge_df['S']/hedge_df.iloc[0]['F'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #weighted_ssr_gvar=( hedge_df['weight_gamma']*(hedge_df['Index Return']**2) ).sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        weight_gamma=np.exp(r*tau)*hedge_df['S']/hedge_df.iloc[0]['F']
+                        #weight= 1/2 S^2 * portfolio gamma (I think)
+                            #for VIX^2 this just =1
+                        weighted_ssr_gvar=(weight_gamma*(hedge_df['Index Return']**2) ).sum()
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (WSSR_Gamma)']=weighted_ssr_gvar
+                        portfolio_dict[id_counter][f'Realized Skew {i+1} month (KNS)']=3*(weighted_ssr_gvar-equal_ssr)
+
+                        hedge_df['pv($2)']=2*np.exp(-r*tau)
+                        #adding in for testing mean difference
+                        hedge_df['days_passed']=(hedge_df['Date']-hedge_df['Date'].shift()).dt.days
+                        
+                        
+                        #This is the block where we delta hedge the VIX^2 index
+                        #VIX^2 delta hedge
+                        #"""
+                        #claim_delta=2/hedge_df.iloc[0]['F']-hedge_df.iloc[0]['pv($2)']/hedge_df.iloc[0]['S'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #the delta of the VIX^2 portfolio is 2/F - 2e^(-rt)/S
+                            #this is measured at the initial date
+                        claim_delta=2/hedge_df.iloc[0]['F']-hedge_df['pv($2)']/hedge_df.iloc[0]['S']
+                        #the number of shares traded to delta hedge is the negative of the claim delta
+                        shares_traded=2/hedge_df.iloc[0]['F']-hedge_df.iloc[0]['pv($2)']/hedge_df['S']
+                        shares_traded*=-1
+                        #ideally this is close to zero, but will be imperfect as S varies
+                        net_delta=claim_delta+shares_traded
+                        #hedging is daily not continuous so there is a lag
+                        PandL=net_delta.shift()*(hedge_df['S']-hedge_df['S'].shift())
+                        #this is the interest paid/eanred from borrowing and lending shares to delta hedge
+                        #PandL-=hedge_df['pv($2)']*(np.exp(r*hedge_df['days_passed']/360)-1)
+                        #hedging P&L reinvested at the risk-free rate
+                        fv_PandL=PandL*np.exp(r*tau)
+                        #total future value of delta hedging payoffs
+                        delta_hedge_payoff=fv_PandL.sum()
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']=delta_hedge_payoff
+                        #VIX^2 Equal SSR
+                        #equal_ssr=(hedge_df['Index Return']**2).sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR) alt']=equal_ssr #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #VIX^2 realized variance (sum of squared returns)
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR)']=equal_ssr
+                        #"""
+                        
+                        """
+                        shares_traded=2/hedge_df.iloc[0]['F']-hedge_df.iloc[0]['pv($2)']/hedge_df['S']
+                        shares_traded*=-1
+                        net_delta=shares_traded
+                        PandL=net_delta.shift()*(hedge_df['S']-hedge_df['S'].shift())
+                        #PandL-=hedge_df['pv($2)']*(np.exp(r*hedge_df['days_passed']/360)-1)
+                        fv_PandL=PandL*np.exp(r*tau)
+                        delta_hedge_payoff=fv_PandL.sum()
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']=delta_hedge_payoff
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR)']=equal_ssr
+                        """
+
+                        """
+                        claim_delta = 2.0 / hedge_df['F'] - hedge_df['pv($2)'] / hedge_df['S']
+                        hedge_df['holding'] = -claim_delta
+                        hedge_df['trade_shares'] = hedge_df['holding'].diff().fillna(hedge_df['holding'])
+                        hedge_df['cash_flow_trades'] = - hedge_df['trade_shares'] * hedge_df['S']
+                        hedge_df['price_move_pnl'] = hedge_df['holding'].shift(1) * (hedge_df['S'] - hedge_df['S'].shift(1))
+                        hedge_df['price_move_pnl'].iloc[0] = 0.0   # no PnL before first day
+                        hedge_df['cash_flow_trades_fv'] = hedge_df['cash_flow_trades'] * np.exp(r * tau)
+                        hedge_df['price_move_pnl_fv'] = hedge_df['price_move_pnl'] * np.exp(r * tau)
+                        delta_hedge_payoff = (hedge_df['price_move_pnl_fv'] + hedge_df['cash_flow_trades_fv']).sum()
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']=delta_hedge_payoff
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR)']=equal_ssr
+                        """
+                        
+                        ############################################################################################
+                        #_____________________________________NEW DELTA HEDGING_____________________________________
+                        ############################################################################################
+                        """
+                        #hedge_df=sp500_df[(sp500_df.Date>=modified_trade_date)&(sp500_df.Date<term)]
+                        #liquidation_values=option_liquidation_query(ticker,
+                        #                    opt_portfolio_2.optionid.dropna().values.tolist(),
+                        #                    liquidation_date)
+                        #df_K0.optionid.values.tolist()
+                        #hedge_df=hedge_df.merge(df_fwd[df_fwd.expiration==term],how='left',left_on=['Date'],right_on=['date'])
+                        optionid_list=opt_portfolio.optionid.dropna().values.tolist()+df_K0.optionid.values.tolist()
+                        option_deltas=option_deltas_query(ticker,
+                                                          optionid_list,
+                                                          modified_trade_date,term)
+                        #ATM call and put are last 2 in the list, use an i to enumrate
+                        #filter out pca from opt portfolio
+                        #use the pca weight/2 for the last 2
+
+
+                        delta_dict = pd.Series(opt_portfolio.dropna(subset=['optionid'])['delta'].values, 
+                                               index=opt_portfolio.dropna(subset=['optionid'])['optionid']).to_dict()
+                        for j,k in zip(df_K0.optionid.values.tolist(),df_K0.delta.values.tolist()):
+                            delta_dict[j]=k
+                        vix_square_delta_hedge_payoff=0
+                        vix_square_weights=opt_portfolio.dropna(subset=['optionid'])['VIX_square_opt_weight'].values.tolist()
+                        x=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].VIX_square_opt_weight.values[0]
+                        vix_square_weights+=[x/2,x/2]
+                        
+
+                        #for id in option_deltas.optionid.unique():
+                        #for id in option_deltas.optionid.unique():
+                        #    option_hedge_df=hedge_df.merge(option_deltas[option_deltas.optionid==id],
+                        #                                   how='left',left_on=['Date'],right_on=['delta_date'])
+                        #    
+                        #    option_hedge_df['delta'].ffill(inplace=True)
+                        #    if id in df_K0.optionid.values.tolist():
+                        #        #use pca weight
+                        #        pass
+                        #    #-np.sign()
+                        for w, (id,d) in zip(vix_square_weights,delta_dict.items()):
+                            option_hedge_df=hedge_df.merge(option_deltas[option_deltas.optionid==id],
+                                                            how='left',left_on=['Date'],right_on=['delta_date'])
+                            option_hedge_df['delta'].ffill(inplace=True)
+                            PandL=option_hedge_df['delta'].shift()*(hedge_df['S']-hedge_df['S'].shift())
+                            PandL*=w
+                            fv_PandL=PandL*np.exp(r*tau)
+                            vix_square_delta_hedge_payoff+=fv_PandL.sum()
+
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']=vix_square_delta_hedge_payoff
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR)']=equal_ssr
+                        ############################################################################################
+                        ############################################################################################
+                        """
+
+
+                        
+                        #SVIX^2 delta hedge
+                        #new delta hedge
+                        #sigma_sq_guess=vix_square #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        sigma_sq_guess=np.exp(r*t)*(opt_portfolio.VIX_opt_weight*opt_portfolio.midpoint_price).sum()
+                        #claim_delta=2*np.exp((r+sigma_sq_guess)*hedge_df.iloc[0]['days_to_maturity']/360)*hedge_df.iloc[0]['S']/(hedge_df.iloc[0]['F']**2) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        claim_delta=2*np.exp((r+sigma_sq_guess)*tau)*hedge_df.iloc[0]['S']/(hedge_df.iloc[0]['F']**2)
+                        shares_traded=2*np.exp((r+sigma_sq_guess)*tau)*hedge_df['S']/(hedge_df.iloc[0]['F']**2)
+                        shares_traded*=-1
+                        net_delta=claim_delta+shares_traded
+                        PandL=net_delta.shift()*(hedge_df['S']-hedge_df['S'].shift())
+                        #PandL-=(2*np.exp((r+sigma_sq_guess)*tau)/(hedge_df.iloc[0]['F']**2))*(np.exp(r*hedge_df['days_passed']/360)-1) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        fv_PandL=PandL*np.exp(r*tau)
+                        delta_hedge_payoff=fv_PandL.sum()
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2 Delta Hedging Payoff']=delta_hedge_payoff
+                        #SVIX^2 return
+                        #hedge_df['gamma']=factor_/2*np.exp(r*tau)*(hedge_df['S']-hedge_df['S'].shift())**2 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #weighted_ssr=( hedge_df['gamma']*(hedge_df['Index Return']**2) ).sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                    
+                    
+                        hedge_df['weight']=np.exp(r*tau)*(hedge_df['S']/hedge_df.iloc[0]['F'])**2 * np.exp((r+sigma_sq_guess)*tau)
+                        weighted_ssr=( hedge_df['weight']*(hedge_df['Index Return']**2) ).sum()
+                        portfolio_dict[id_counter][f'Realized Variance {i+1} month (WSSR)']=weighted_ssr
+                        #portfolio_dict[id_counter][f'{i} month Realized Weighted Variance Return (%)']=(weighted_ssr/portfolio_dict[id_counter][f'{i} month SVIX^2']-1)*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i} month SVIX^2 Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i} month SVIX^2 payoff']+monthly_portfolios[f'{i} month VIX^2 Delta Hedging Payoff'])/monthly_portfolios[f'{i} month VIX^2']-1)*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #monthly_portfolios[f'{i} month VIX^2 Payoff w/ Delta Hedging ($)']=monthly_portfolios[f'{i} month VIX^2 payoff']+monthly_portfolios[f'{i} month VIX^2 Delta Hedging Payoff'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        
+                        
+                        
+                        #Entropy Contract Payoff
+                        sigma_sq_guess=vix_square
+                        claim_delta=2/hedge_df.iloc[0]['F']*(np.log(hedge_df.iloc[0]['S']/hedge_df.iloc[0]['F'])+1+(r+0.5*sigma_sq_guess)*hedge_df.iloc[0]['days_to_maturity']/360)
+                        shares_traded=2/hedge_df.iloc[0]['F']*(np.log(hedge_df['S']/hedge_df.iloc[0]['F'])+1+(r+0.5*sigma_sq_guess)*tau)
+                        shares_traded*=-1
+                        net_delta=claim_delta+shares_traded
+                        PandL=net_delta.shift()*(hedge_df['S']-hedge_df['S'].shift())
+                        #PandL-=(2*np.exp((r+sigma_sq_guess)*tau)/(hedge_df.iloc[0]['F']**2))*(np.exp(r*hedge_df['days_passed']/360)-1) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        fv_PandL=PandL*np.exp(r*tau)
+                        delta_hedge_payoff=fv_PandL.sum()
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2 Delta Hedging Payoff']=delta_hedge_payoff
+                        
+                        #moving to earlier
+                        #hedge_df['weight_gamma']=np.exp(r*tau)*hedge_df['S']/hedge_df.iloc[0]['F'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #weighted_ssr=( hedge_df['weight_gamma']*(hedge_df['Index Return']**2) ).sum() #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'Realized Variance {i+1} month (WSSR_Gamma)']=weighted_ssr_gvar #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+
+                        
+                        
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS Delta Hedging Payoff']=3*(portfolio_dict[id_counter][f'{i+1} month GVIX^2 Delta Hedging Payoff']-portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff'])
+                        
+
+
+                        portfolio_dict[id_counter][f'{i+1} month VIX return (%)']=(portfolio_dict[id_counter][f'{i+1} month VIX payoff']/portfolio_dict[id_counter][f'{i+1} month VIX']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 return (%)']=(portfolio_dict[id_counter][f'{i+1} month VIX^2 payoff']/portfolio_dict[id_counter][f'{i+1} month VIX^2']-1)*100
+                        #portfolio_dict[id_counter][f'{i} month VIX^2 Delta Hedged return(%)']=portfolio_dict[id_counter][f'{i} month VIX^2 return (%)']+monthly_portfolios['1 month VIX^2 Delta Hedging Payoff'] #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #portfolio_dict[id_counter][f'{i} month VIX^2 Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i} month VIX^2 payoff']+monthly_portfolios[f'{i} month VIX^2 Delta Hedging Payoff'])/monthly_portfolios[f'{i} month VIX^2']-1)*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i+1} month VIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff'])/portfolio_dict[id_counter][f'{i+1} month VIX^2']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month VIX^2 Payoff w/ Delta Hedging ($)']=portfolio_dict[id_counter][f'{i+1} month VIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month VIX^2 Delta Hedging Payoff']
+                        
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2 return (%)']=(portfolio_dict[id_counter][f'{i+1} month SVIX^2 payoff']/portfolio_dict[id_counter][f'{i+1} month SVIX^2']-1)*100
+                        #portfolio_dict[id_counter][f'{i} month Realized Weighted Variance Return (%)']=(weighted_ssr/portfolio_dict[id_counter][f'{i} month SVIX^2']-1)*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month Realized Weighted Variance Return (%)']=(portfolio_dict[id_counter][f'Realized Variance {i+1} month (WSSR)']/portfolio_dict[id_counter][f'{i+1} month SVIX^2']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2 Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i+1} month SVIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month SVIX^2 Delta Hedging Payoff'])/portfolio_dict[id_counter][f'{i+1} month SVIX^2']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SVIX^2 Payoff w/ Delta Hedging ($)']=portfolio_dict[id_counter][f'{i+1} month SVIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month SVIX^2 Delta Hedging Payoff']
+
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2 Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i+1} month GVIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month GVIX^2 Delta Hedging Payoff'])/portfolio_dict[id_counter][f'{i+1} month GVIX^2']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2 Payoff w/ Delta Hedging ($)']=portfolio_dict[id_counter][f'{i+1} month GVIX^2 payoff']+portfolio_dict[id_counter][f'{i+1} month GVIX^2 Delta Hedging Payoff']
+                        portfolio_dict[id_counter][f'{i+1} month Realized Weighted_Gamma Variance Return (%)']=(portfolio_dict[id_counter][f'Realized Variance {i+1} month (WSSR_Gamma)']/portfolio_dict[id_counter][f'{i+1} month GVIX^2']-1)*100
+
+                        portfolio_dict[id_counter][f'{i+1} month SVIX return (%)']=(portfolio_dict[id_counter][f'{i+1} month SVIX payoff']/portfolio_dict[id_counter][f'{i+1} month SVIX']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month CBOE SKEW return (%)']=(portfolio_dict[id_counter][f'{i+1} month CBOE SKEW payoff']/portfolio_dict[id_counter][f'{i+1} month CBOE SKEW']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 return (%)']=(portfolio_dict[id_counter][f'{i+1} month SKEW Method 2 payoff']/portfolio_dict[id_counter][f'{i+1} month SKEW Method 2']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SSKEW return (%)']=(portfolio_dict[id_counter][f'{i+1} month SSKEW payoff']/portfolio_dict[id_counter][f'{i+1} month SSKEW']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month GVIX^2 return (%)']=(portfolio_dict[id_counter][f'{i+1} month GVIX^2 payoff']/portfolio_dict[id_counter][f'{i+1} month GVIX^2']-1)*100
+
+                        #KNS SKEW
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS return (%)']=(portfolio_dict[id_counter][f'{i+1} month SKEW_KNS payoff']/portfolio_dict[id_counter][f'{i+1} month SKEW_KNS']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS Delta Hedged return(%)']=((portfolio_dict[id_counter][f'{i+1} month SKEW_KNS payoff']+portfolio_dict[id_counter][f'{i+1} month SKEW_KNS Delta Hedging Payoff'])/portfolio_dict[id_counter][f'{i+1} month SKEW_KNS']-1)*100
+                        portfolio_dict[id_counter][f'{i+1} month SKEW_KNS Payoff w/ Delta Hedging ($)']=portfolio_dict[id_counter][f'{i+1} month SKEW_KNS payoff']+portfolio_dict[id_counter][f'{i+1} month SKEW_KNS Delta Hedging Payoff']
+                        portfolio_dict[id_counter][f'{i+1} month Realized Weighted Skew Return (%)']=(portfolio_dict[id_counter][f'Realized Skew {i+1} month (KNS)']/portfolio_dict[id_counter][f'{i+1} month SKEW_KNS']-1)*100
+
+
+                        #portfolio_dict[id_counter][f'{i+1} month Realized Variance Return (%) alt']=(portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR) alt']/portfolio_dict[id_counter][f'{i+1} month VIX^2']-1)*100 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        portfolio_dict[id_counter][f'{i+1} month Realized Variance Return (%)']=(portfolio_dict[id_counter][f'Realized Variance {i+1} month (SSR)']/portfolio_dict[id_counter][f'{i+1} month VIX^2']-1)*100
+
+
+
+                        
+                        #misc things to add to option portfolios
+                        opt_portfolio['sigma']=sigma
+                        opt_portfolio['sigma_other']=vix_square**(3/2)
+                        opt_portfolio['P1']=P1
+                        maturity_id=i+1
+                        opt_portfolio['portfolio_id']=id_counter
+                        opt_portfolio['maturity_id']=maturity_id
+                        opt_portfolio['trade_date']=expir
+                        opt_portfolio['modified_trade_date']=modified_trade_date
+
+                        #countin number of options and range of moneyness
+                        portfolio_dict[id_counter][f'{i+1} month number of options']=opt_portfolio.shape[0]+1
+                        portfolio_dict[id_counter][f'{i+1} month max moneyness']=opt_portfolio.strike_price.max()/F
+                        portfolio_dict[id_counter][f'{i+1} month min moneyness']=opt_portfolio.strike_price.min()/F
+                        portfolio_dict[id_counter][f'{i+1} month market gross return']=settle_value/F
+                        portfolio_dict[id_counter][f'{i+1} month F']=F
+                        portfolio_dict[id_counter][f'{i+1} month S_T']=settle_value
+                        portfolio_dict[id_counter][f'{i+1} month interest rate']=r
+                        
+
+
+                        ###########FOR DOUBLE CHECK###########
+                        """
+                        if expir==pd.Timestamp('2023-06-16 00:00:00'):
+                            opt_portfolio['interest_factor']=np.exp(r*t)
+                            opt_portfolio['S_T']=settle_value
+                            opt_portfolio['F']=F
+                            opt_portfolio['t']=t
+                            opt_portfolio.to_csv(f'{i+1}month_option_portfolio_{expir}.csv')
+                        if expir==pd.Timestamp('2023-08-18 00:00:00'):
+                            opt_portfolio['interest_factor']=np.exp(r*t)
+                            opt_portfolio['S_T']=settle_value
+                            opt_portfolio['F']=F
+                            opt_portfolio['t']=t
+                            opt_portfolio.to_csv(f'{i+1}month_option_portfolio_{expir}.csv')
+                        """
+                        #######################################
+                        misc_cols=['sigma','sigma_other','P1','portfolio_id','maturity_id','trade_date','modified_trade_date']
+
+                        weight_cols=['VIX_opt_weight','VIX_square_opt_weight','VIX_square_bid_contribtion','VIX_square_ask_contribtion',
+                                    'SVIX_opt_weight','SVIX_square_opt_weight','SVIX_square_bid_contribtion','SVIX_square_ask_contribtion',
+                                    'GVIX_square_opt_weight','GVIX_square_bid_contribtion','GVIX_square_ask_contribtion',
+                                    'meth1_opt_weight','meth1_bid_contribtion','meth1_ask_contribtion',
+                                    'meth2_opt_weight','meth2_bid_contribtion','meth2_ask_contribtion',
+                                    'meth3_opt_weight','meth3_bid_contribtion','meth3_ask_contribtion',
+                                    'SKEW_KNS_opt_weight','SKEW_KNS_bid_contribtion','SKEW_KNS_ask_contribtion']
+
+                        df_K0=df_K0[['strike_price','cp_flag','midpoint_price','best_bid','best_offer','optionid']]
+                        df_K0['dK']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].dK.values[0]
+                        for col in misc_cols:
+                            df_K0[f'{col}']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'][f'{col}'].values[0]
+
+                        #df_K0['delta']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].delta.values[0]*1/2 #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #split the weight 50-50 for the ATM call and put
+                        for col in weight_cols:
+                            df_K0[f'{col}']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'][f'{col}'].values[0]*1/2
+                        #df_K0['VIX_opt_weight']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].VIX_opt_weight.values[0]*1/2       #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #df_K0['SVIX_opt_weight']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].SVIX_opt_weight.values[0]*1/2     #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #df_K0['meth1_opt_weight']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].meth1_opt_weight.values[0]*1/2   #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #df_K0['meth2_opt_weight']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].meth2_opt_weight.values[0]*1/2   #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #df_K0['meth3_opt_weight']=opt_portfolio[opt_portfolio.cp_flag=='P/C Avg'].meth3_opt_weight.values[0]*1/2   #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        opt_portfolio=opt_portfolio[opt_portfolio.cp_flag!='P/C Avg']
+
+                        opt_portfolio_2=pd.concat([opt_portfolio,df_K0])
+                        #opt_portfolio_2=pd.concat([opt_portfolio,df_K0])[['strike_price',                  #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                        #                                                    'cp_flag',                     
+                        #                                                    'dK',                          
+                        #                                                    'midpoint_price',              
+                        #                                                    'best_bid','best_offer',       
+                        #                                                    'optionid',                    
+                        #                                                    'VIX_opt_weight',              
+                        #                                                    'SVIX_opt_weight',
+                        #                                                    'meth1_opt_weight',
+                        #                                                    'meth2_opt_weight',
+                        #                                                    'meth3_opt_weight']]
+                        opt_portfolio_2.sort_values(by=['strike_price','cp_flag'],ascending=[True,False],inplace=True)
+
+                        if i+1==3:
+                            liquidation_date=expirs_found[i-1]
+                            #print(f'{i} month liquidation_date:{liquidation_date}') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print('--------------------') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.optionid.size) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print( len(set(opt_portfolio_2.optionid.values.tolist())) ) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            liquidation_values=option_liquidation_query(ticker,
+                                                                        opt_portfolio_2.optionid.dropna().values.tolist(),
+                                                                        liquidation_date)
+                            opt_portfolio_2=opt_portfolio_2.merge(liquidation_values,how='left',on=['optionid'])
+                            opt_portfolio_2.rename(columns={'liquidation_midprice_date':f'{i+1}M port liquidation_midprice_date'},inplace=True)
+                            #display(opt_portfolio_2[pd.isnull(opt_portfolio_2[f'{i+1}M port liquidation_midprice_date'])]) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            vix_square_liquidation_value=(t*opt_portfolio_2.VIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month VIX^2 liquidation']=vix_square_liquidation_value
+                            gvix_square_liquidation_value=(t*opt_portfolio_2.GVIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month GVIX^2 liquidation']=gvix_square_liquidation_value
+
+                        elif i+1==2:
+                            #pass
+                            liquidation_date=expirs_found[i-1]
+                            #print(f'{i} month liquidation_date:{liquidation_date}') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.shape) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print('--------------------') #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print(opt_portfolio_2.optionid.size) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            #print( len(set(opt_portfolio_2.optionid.values.tolist())) ) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            liquidation_values=option_liquidation_query(ticker,
+                                                opt_portfolio_2.optionid.dropna().values.tolist(),
+                                                liquidation_date)
+                    
+                            opt_portfolio_2=opt_portfolio_2.merge(liquidation_values,how='left',on=['optionid'])
+                            opt_portfolio_2.rename(columns={'liquidation_midprice_date':f'{i+1}M port liquidation_midprice_date'},inplace=True)
+                            #display(opt_portfolio_2[pd.isnull(opt_portfolio_2[f'{i+1}M port liquidation_midprice_date'])]) #THIS COMMENTED OUT CODE (NOT AN EXPLANATION)
+                            vix_square_liquidation_value=(t*opt_portfolio_2.VIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month VIX^2 liquidation']=vix_square_liquidation_value
+                            gvix_square_liquidation_value=(t*opt_portfolio_2.GVIX_opt_weight*opt_portfolio_2.liquidation_midprice).sum()
+                            portfolio_dict[id_counter][f'{i+1} month GVIX^2 liquidation']=gvix_square_liquidation_value
+
+                        ###########FOR DOUBLE CHECK###########
+                        #opt_portfolio['interest_factor']=np.exp(r*t)
+                        #opt_portfolio['S_T']=settle_value
+                        """
+                        if expir==pd.Timestamp('2023-06-16 00:00:00'):
+                            opt_portfolio_2.to_csv(f'{i+1}month_option_portfolio_2_{expir}.csv')
+                        if expir==pd.Timestamp('2023-08-18 00:00:00'):
+                            opt_portfolio_2.to_csv(f'{i+1}month_option_portfolio_2_{expir}.csv')
+                        """
+                        #######################################
+
+
+                        option_portfolios.append(opt_portfolio)
+                        #option_portfolios.append(opt_portfolio_2)
+
+                        #print(6/0)
+
+                        
+
+
+                    id_counter+=1            
+
+            
+            #next_expir = pd.Series(slice_.exdate.unique()).nsmallest(3)
+            #portfolio_dict[id_counter]={'Trade Date':expir}
+            #portfolio_dict[id_counter]['modified_trade_date']=modified_trade_date
+
+            #print('----------------------------------')
+    
+    option_portfolios_df=pd.concat(option_portfolios)
+
+    monthly_portfolios=pd.DataFrame.from_dict(portfolio_dict).T.dropna(subset=['1 month expiration'])
+    monthly_portfolios=monthly_portfolios[monthly_portfolios['Trade Date']<monthly_portfolios['1 month expiration']]
+    monthly_portfolios['1 month DTE']=monthly_portfolios['1 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['2 month DTE']=monthly_portfolios['2 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['3 month DTE']=monthly_portfolios['3 month expiration']-monthly_portfolios['modified_trade_date']
+    monthly_portfolios['1 month DTE']=monthly_portfolios['1 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['2 month DTE']=monthly_portfolios['2 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['3 month DTE']=monthly_portfolios['3 month DTE'].apply(lambda x:x.days)
+    monthly_portfolios['Trade Date']=pd.to_datetime(monthly_portfolios['Trade Date'])
+    monthly_portfolios['modified_trade_date']=pd.to_datetime(monthly_portfolios['modified_trade_date'])#.dt.date
+    monthly_portfolios['1 month expiration']=pd.to_datetime(monthly_portfolios['1 month expiration'])#.dt.date
+    monthly_portfolios['2 month expiration']=pd.to_datetime(monthly_portfolios['2 month expiration'])#.dt.date
+    monthly_portfolios['3 month expiration']=pd.to_datetime(monthly_portfolios['3 month expiration'])#.dt.date
+    warnings.resetwarnings()
+    #return portfolio_dict, option_portfolios
+    return monthly_portfolios, option_portfolios_df

@@ -289,3 +289,65 @@ def option_deltas_query(tick,option_ids,start,end):
     df.rename(columns={'date':'delta_date'},inplace=True)
     return df
 
+
+
+#uniqueness inquiery to figure out if different options (by type, strike) have different prices
+def quote_uniqueness_aggregation(tick,lb_year,ub_year):
+    sec_id_map={'DJX':102456, #Dow Jones Industrial Average
+    'NDX':102480, #NASDAQ 100 Index
+    'MNX':102491, #CBOE Mini-NDX Index
+    'XMI':101499, #AMEX Major Market Index
+    'SPX':108105, #S&P 500 Index
+    'OEX':109764, #S&P 100 Index
+    'MID':101507, #S&P Midcap 400 Index
+    'SML':102442, #S&P Smallcap 600 Index
+    'RUT':102434, #Russell 2000 Index
+    'NYZ':107880, #NYSE Composite Index (Old)
+    'WSX':108656  #PSE Wilshire Smallcap Index
+    }
+    
+    date_col_used='date'
+    #lb_year,ub_year=1997,2023
+    quote_blocks=[]
+
+    for yr in range(lb_year,ub_year+1):
+        
+        block= f"""SELECT optionid, date, exdate, cp_flag,
+            (exdate::date - date::date) AS days_to_expiration,
+            strike_price/1000 as strike_price
+        FROM optionm.opprcd{yr}
+        WHERE secid = {sec_id_map.get(tick)}
+            AND CAST(am_settlement AS INTEGER) = 1
+            AND CAST(ss_flag AS INTEGER) = 0
+            AND (best_bid>0 AND best_bid IS NOT NULL)
+        """
+        #print(req)
+        #print(4/0)
+        quote_blocks.append(block)
+    
+    req="WITH combined AS ("
+    req+="\nUNION ALL\n".join(quote_blocks)
+    req+='\n)'
+
+    req+=f"""
+        SELECT date, 
+            days_to_expiration,
+            strike_price,
+            cp_flag,
+            COUNT(optionid)
+        FROM combined
+        GROUP BY date, days_to_expiration, strike_price, cp_flag
+        ORDER BY date, days_to_expiration, strike_price, cp_flag
+        """
+    df = db.raw_sql(req, date_cols=['date'])
+    return df
+
+
+#req+=f"""
+#SELECT date, 
+#        days_to_expiration,
+#        COUNT(optionid)
+#FROM combined
+#GROUP BY date, days_to_expiration
+#ORDER BY date, days_to_expiration;
+#"""
