@@ -413,7 +413,7 @@ def compute_option_portfolios(num_periods_wanted=3,lb_year=1998,ub_year=2023,tic
                                                     orient='index').T
                         #opt_portfolio is the dataframe with the OOM options
                             #it consists of puts, calls and an avg of the ATM put and call
-                        opt_portfolio=pd.concat([incl_puts,pca,incl_calls])[['strike_price',
+                        opt_portfolio=pd.concat([incl_puts,incl_calls])[['strike_price',
                                                                             'cp_flag',
                                                                             'midpoint_price',
                                                                             'best_bid','best_offer',
@@ -686,7 +686,6 @@ def compute_option_portfolios(num_periods_wanted=3,lb_year=1998,ub_year=2023,tic
 
 #summ_stats_3.to_csv('hedged_vix_returns/hedged_returns_summary_stats.csv')
 #expectations_hypothesis_testing
-
 def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
 
     regression_stats={}
@@ -730,43 +729,38 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             data['FVAR(t,t+k+1) - VAR(t+k)']=data['FVAR(t,t+k+1)']-data['VAR(t+k)']
                             #data['-(VAR(t+k)-VAR(t))']=-(data['VAR(t+k)']-data['VAR(t)'])
                             data.dropna(inplace=True)
-                            #display(data)
 
                             ###################################
                             #data=data[~data['Trade Date'].dt.year.isin([2008])]
 
+
                             fh.write(f"--- {v} {k+1} Month Regression ---\n")
-                            fh.write(f"---- Continuous HPR Version ----\n")
-                            fh.write(f"----- Primal Regression -----\n")
+                            fh.write(f"--------- Continuous HPR Version ---------\n")
+                            fh.write(f"{v}(t;1) has a 1-month maturity at time t\n")
+                            fh.write(f"{v}(t+{k+1};1) has a 1-month maturity at time t+{k+1}\n")
+                            fh.write(f"F{v}(t,t+{k+1}) = {v}(t+{k+1};1)-{v}(t;1)\n")
+                            fh.write(f"------------ Primal Regression ------------\n")
                             #Primal: VAR(t+k)-VAR(t) = a + b(FVAR(t,t+k+1)-VAR(t)) + e(t+k)
+                            fh.write(f"Regression Equation: {v}(t+{k+1};1)-{v}(t;1) = ⍺ + β(F{v}(t,t+{k+1})-{v}(t;1)) + e(t+{k+1})")
                             #"""
                             y=data['VAR(t+k)']-data['VAR(t)']
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
                             ols_model = sm.OLS(y, x)
                             primal_ols_results= ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
-                            #print('primal')
-                            #print(primal_ols_results.params['const'])
-                            #print(primal_ols_results.params[0])
-                            #print(primal_ols_results.resid.mean())
-                            #print( primal_ols_results.summary() )
-                            #"""
-                            fh.write(primal_ols_results.summary().as_text())
+
+                            fh.write(primal_ols_results.summary(yname=f'{v}(t+{k+1};1)-{v}(t;1)',xname=['Intercept',f'F{v}(t,t+k+1)-{v}(t)']).as_text())
                             fh.write("\n\n")
 
                             #Dual: 
-                            fh.write(f"--- Dual Regression ---\n")
-                            #"""
+                            fh.write(f"------------ Dual Regression ------------\n")
+                            fh.write(f"Regression Equation: F{v}(t,t+{k+1})-{v}(t+{k+1};1) = -⍺ + (1-β)(F{v}(t,t+{k+1})-{v}(t;1)) - e(t+{k+1})")
+
                             y=data['H']
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
                             ols_model = sm.OLS(y, x)
                             dual_ols_results = ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
-                            #print('dual')
-                            #print(dual_ols_results.params['const'])
-                            #print(dual_ols_results.params[0])
-                            #print(dual_ols_results.resid.mean())
-                            #print( dual_ols_results.summary() )
-                            #"""
-                            fh.write(dual_ols_results.summary().as_text())
+
+                            fh.write(dual_ols_results.summary(yname=f'F{v}(t,t+{k+1})-{v}(t+{k+1};1)',xname=['Intercept',f'F{v}(t,t+k+1)-{v}(t)']).as_text())
                             fh.write("\n\n")
 
                             data['alpha_primal']=primal_ols_results.params['const']
@@ -777,12 +771,6 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             data['Avg(e)_dual']=dual_ols_results.resid.mean()
                             data['sum(a)']=primal_ols_results.params['const']+dual_ols_results.params['const']
                             data['sum(B)-1']=primal_ols_results.params[0]+dual_ols_results.params[0]-1
-                            #display(data)
-                            #print('Summary')
-                            #print('sum(a)')
-                            #print(primal_ols_results.params['const']+dual_ols_results.params['const'])
-                            #print('sum(B)-1')
-                            #print(primal_ols_results.params[0]+dual_ols_results.params[0]-1)
 
                             
 
@@ -804,7 +792,7 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                                             }
                             #print('-------------------------')
 
-                            #print('Discrete Version')
+
                             fh.write(f"---- Dicrete HPR Version ----\n")
                             fh.write(f"----- Dual Regression -----\n")
 
@@ -815,12 +803,6 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             fh.write(dual_ols_results.summary().as_text())
                             fh.write("\n\n")
 
-                            #print('dual')
-                            #print(dual_ols_results.params['const'])
-                            #print(dual_ols_results.params[0])
-                            #print(dual_ols_results.resid.mean())
-                            #print( dual_ols_results.summary() )
-                            #"""
                             data['alpha_primal']=primal_ols_results.params['const']
                             data['beta_primal']=primal_ols_results.params[0]
                             data['Avg(e)_primal']=primal_ols_results.resid.mean()
@@ -829,12 +811,6 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             data['Avg(e)_dual']=dual_ols_results.resid.mean()
                             data['sum(a)']=primal_ols_results.params['const']+dual_ols_results.params['const']
                             data['sum(B)-1']=primal_ols_results.params[0]+dual_ols_results.params[0]-1
-                            #display(data)
-                            #print('Summary')
-                            #print('sum(a)')
-                            #print(primal_ols_results.params['const']+dual_ols_results.params['const'])
-                            #print('sum(B)-1')
-                            #print(primal_ols_results.params[0]+dual_ols_results.params[0]-1)
 
 
                             regression_stats[k][v]['discrete']={'⍺_primal_coef':primal_ols_results.params['const'],
@@ -852,7 +828,7 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                                                     'sum(β)':primal_ols_results.params[0]+dual_ols_results.params[0],
                                                     }
                             
-                            #separata regression
+                            
 
                             #print('------------------------------------')
 

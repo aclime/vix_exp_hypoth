@@ -413,7 +413,9 @@ def compute_option_portfolios(num_periods_wanted=3,lb_year=1998,ub_year=2023,tic
                                                     orient='index').T
                         #opt_portfolio is the dataframe with the OOM options
                             #it consists of puts, calls and an avg of the ATM put and call
-                        opt_portfolio=pd.concat([incl_puts,pca,incl_calls])[['strike_price',
+                        
+                        #opt_portfolio=pd.concat([incl_puts,pca,incl_calls])
+                        opt_portfolio=pd.concat([incl_puts,incl_calls])[['strike_price',
                                                                             'cp_flag',
                                                                             'midpoint_price',
                                                                             'best_bid','best_offer',
