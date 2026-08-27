@@ -19,7 +19,7 @@ if __name__ == "__main__":
                          expectation_hypothesis_regressions,
                          )
 
-    lb_year=2020
+    lb_year=1998
     ub_year=2023
     ticker='SPX'
     num_periods_wanted=3

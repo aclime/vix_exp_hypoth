@@ -1,168 +1,174 @@
 --- VIX^2 2 Month Regression ---
----- Continuous HPR Version ----
------ Primal Regression -----
-                            OLS Regression Results                            
+--------- Continuous HPR Version ---------
+VIX^2(t;1) has a 1-month maturity at time t
+VIX^2(t+2;1) has a 1-month maturity at time t+2
+FVIX^2(t,t+2) = VIX^2(t+2;1)-VIX^2(t;1)
+------------ Primal Regression ------------
+Regression Equation: VIX^2(t+2;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+2)-VIX^2(t;1)) + e(t+2)                               OLS Regression Results                              
+===================================================================================
+Dep. Variable:     VIX^2(t+2;1)-VIX^2(t;1)   R-squared:                       0.025
+Model:                                 OLS   Adj. R-squared:                  0.022
+Method:                      Least Squares   F-statistic:                     6.677
+Date:                     Wed, 26 Aug 2026   Prob (F-statistic):             0.0102
+Time:                             21:54:46   Log-Likelihood:                 1286.7
+No. Observations:                      311   AIC:                            -2569.
+Df Residuals:                          309   BIC:                            -2562.
+Df Model:                                1                                         
+Covariance Type:                       HAC                                         
+============================================================================================
+                               coef    std err          z      P>|z|      [0.025      0.975]
+--------------------------------------------------------------------------------------------
+Intercept                   -0.0002      0.000     -0.949      0.343      -0.001       0.000
+FVIX^2(t,t+k+1)-VIX^2(t)     0.3262      0.126      2.584      0.010       0.079       0.574
 ==============================================================================
-Dep. Variable:                      y   R-squared:                       0.025
-Model:                            OLS   Adj. R-squared:                  0.003
-Method:                 Least Squares   F-statistic:                    0.4765
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):              0.494
-Time:                        01:25:19   Log-Likelihood:                 175.18
-No. Observations:                  47   AIC:                            -346.4
-Df Residuals:                      45   BIC:                            -342.7
-Df Model:                           1                                         
-Covariance Type:                  HAC                                         
-==============================================================================
-                 coef    std err          z      P>|z|      [0.025      0.975]
-------------------------------------------------------------------------------
-const          0.0011      0.002      0.602      0.547      -0.002       0.005
-0             -0.8062      1.168     -0.690      0.490      -3.096       1.483
-==============================================================================
-Omnibus:                       48.144   Durbin-Watson:                   2.882
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):              602.071
-Skew:                           1.977   Prob(JB):                    1.83e-131
-Kurtosis:                      20.082   Cond. No.                         873.
-==============================================================================
-
-Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
-
---- Dual Regression ---
-                            OLS Regression Results                            
-==============================================================================
-Dep. Variable:                      H   R-squared:                       0.112
-Model:                            OLS   Adj. R-squared:                  0.092
-Method:                 Least Squares   F-statistic:                     2.391
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):              0.129
-Time:                        01:25:19   Log-Likelihood:                 175.18
-No. Observations:                  47   AIC:                            -346.4
-Df Residuals:                      45   BIC:                            -342.7
-Df Model:                           1                                         
-Covariance Type:                  HAC                                         
-==============================================================================
-                 coef    std err          z      P>|z|      [0.025      0.975]
-------------------------------------------------------------------------------
-const         -0.0011      0.002     -0.602      0.547      -0.005       0.002
-0              1.8062      1.168      1.546      0.122      -0.483       4.096
-==============================================================================
-Omnibus:                       48.144   Durbin-Watson:                   2.882
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):              602.071
-Skew:                          -1.977   Prob(JB):                    1.83e-131
-Kurtosis:                      20.082   Cond. No.                         873.
+Omnibus:                      282.321   Durbin-Watson:                   2.357
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            25917.834
+Skew:                           3.138   Prob(JB):                         0.00
+Kurtosis:                      47.280   Cond. No.                         528.
 ==============================================================================
 
 Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
+
+------------ Dual Regression ------------
+Regression Equation: FVIX^2(t,t+2)-VIX^2(t+2;1) = -⍺ + (1-β)(FVIX^2(t,t+2)-VIX^2(t;1)) - e(t+2)                                OLS Regression Results                                
+======================================================================================
+Dep. Variable:     FVIX^2(t,t+2)-VIX^2(t+2;1)   R-squared:                       0.098
+Model:                                    OLS   Adj. R-squared:                  0.096
+Method:                         Least Squares   F-statistic:                     28.50
+Date:                        Wed, 26 Aug 2026   Prob (F-statistic):           1.82e-07
+Time:                                21:54:46   Log-Likelihood:                 1286.7
+No. Observations:                         311   AIC:                            -2569.
+Df Residuals:                             309   BIC:                            -2562.
+Df Model:                                   1                                         
+Covariance Type:                          HAC                                         
+============================================================================================
+                               coef    std err          z      P>|z|      [0.025      0.975]
+--------------------------------------------------------------------------------------------
+Intercept                    0.0002      0.000      0.949      0.343      -0.000       0.001
+FVIX^2(t,t+k+1)-VIX^2(t)     0.6738      0.126      5.338      0.000       0.426       0.921
+==============================================================================
+Omnibus:                      282.321   Durbin-Watson:                   2.357
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            25917.834
+Skew:                          -3.138   Prob(JB):                         0.00
+Kurtosis:                      47.280   Cond. No.                         528.
+==============================================================================
+
+Notes:
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
 
 ---- Dicrete HPR Version ----
 ----- Dual Regression -----
                             OLS Regression Results                            
 ==============================================================================
-Dep. Variable:             H_discrete   R-squared:                       0.070
-Model:                            OLS   Adj. R-squared:                  0.049
-Method:                 Least Squares   F-statistic:                     1.867
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):              0.179
-Time:                        01:25:19   Log-Likelihood:                 151.69
-No. Observations:                  47   AIC:                            -299.4
-Df Residuals:                      45   BIC:                            -295.7
+Dep. Variable:             H_discrete   R-squared:                       0.004
+Model:                            OLS   Adj. R-squared:                  0.001
+Method:                 Least Squares   F-statistic:                    0.8100
+Date:                Wed, 26 Aug 2026   Prob (F-statistic):              0.369
+Time:                        21:54:46   Log-Likelihood:                 1219.8
+No. Observations:                 311   AIC:                            -2436.
+Df Residuals:                     309   BIC:                            -2428.
 Df Model:                           1                                         
 Covariance Type:                  HAC                                         
 ==============================================================================
                  coef    std err          z      P>|z|      [0.025      0.975]
 ------------------------------------------------------------------------------
-const         -0.0022      0.003     -0.721      0.471      -0.008       0.004
-0              2.2973      1.681      1.366      0.172      -0.998       5.593
+const          0.0007      0.000      2.293      0.022    9.59e-05       0.001
+0              0.1635      0.182      0.900      0.368      -0.193       0.520
 ==============================================================================
-Omnibus:                       86.515   Durbin-Watson:                   2.604
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):             1816.995
-Skew:                          -4.858   Prob(JB):                         0.00
-Kurtosis:                      31.869   Cond. No.                         873.
+Omnibus:                      214.141   Durbin-Watson:                   2.356
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            46994.085
+Skew:                           1.671   Prob(JB):                         0.00
+Kurtosis:                      63.128   Cond. No.                         528.
 ==============================================================================
 
 Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
 
 --- VIX^2 3 Month Regression ---
----- Continuous HPR Version ----
------ Primal Regression -----
-                            OLS Regression Results                            
+--------- Continuous HPR Version ---------
+VIX^2(t;1) has a 1-month maturity at time t
+VIX^2(t+3;1) has a 1-month maturity at time t+3
+FVIX^2(t,t+3) = VIX^2(t+3;1)-VIX^2(t;1)
+------------ Primal Regression ------------
+Regression Equation: VIX^2(t+3;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+3)-VIX^2(t;1)) + e(t+3)                               OLS Regression Results                              
+===================================================================================
+Dep. Variable:     VIX^2(t+3;1)-VIX^2(t;1)   R-squared:                       0.091
+Model:                                 OLS   Adj. R-squared:                  0.088
+Method:                      Least Squares   F-statistic:                     7.853
+Date:                     Wed, 26 Aug 2026   Prob (F-statistic):            0.00540
+Time:                             21:54:46   Log-Likelihood:                 1226.5
+No. Observations:                      310   AIC:                            -2449.
+Df Residuals:                          308   BIC:                            -2442.
+Df Model:                                1                                         
+Covariance Type:                       HAC                                         
+============================================================================================
+                               coef    std err          z      P>|z|      [0.025      0.975]
+--------------------------------------------------------------------------------------------
+Intercept                   -0.0002      0.000     -0.725      0.468      -0.001       0.000
+FVIX^2(t,t+k+1)-VIX^2(t)     0.4530      0.162      2.802      0.005       0.136       0.770
 ==============================================================================
-Dep. Variable:                      y   R-squared:                       0.066
-Model:                            OLS   Adj. R-squared:                  0.045
-Method:                 Least Squares   F-statistic:                    0.8799
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):              0.353
-Time:                        01:25:19   Log-Likelihood:                 168.30
-No. Observations:                  46   AIC:                            -332.6
-Df Residuals:                      44   BIC:                            -328.9
-Df Model:                           1                                         
-Covariance Type:                  HAC                                         
-==============================================================================
-                 coef    std err          z      P>|z|      [0.025      0.975]
-------------------------------------------------------------------------------
-const          0.0024      0.003      0.836      0.403      -0.003       0.008
-0             -1.1434      1.219     -0.938      0.348      -3.532       1.246
-==============================================================================
-Omnibus:                       41.515   Durbin-Watson:                   1.263
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):              312.571
-Skew:                           1.836   Prob(JB):                     1.34e-68
-Kurtosis:                      15.231   Cond. No.                         688.
-==============================================================================
-
-Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
-
---- Dual Regression ---
-                            OLS Regression Results                            
-==============================================================================
-Dep. Variable:                      H   R-squared:                       0.200
-Model:                            OLS   Adj. R-squared:                  0.182
-Method:                 Least Squares   F-statistic:                     3.092
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):             0.0856
-Time:                        01:25:19   Log-Likelihood:                 168.30
-No. Observations:                  46   AIC:                            -332.6
-Df Residuals:                      44   BIC:                            -328.9
-Df Model:                           1                                         
-Covariance Type:                  HAC                                         
-==============================================================================
-                 coef    std err          z      P>|z|      [0.025      0.975]
-------------------------------------------------------------------------------
-const         -0.0024      0.003     -0.836      0.403      -0.008       0.003
-0              2.1434      1.219      1.758      0.079      -0.246       4.532
-==============================================================================
-Omnibus:                       41.515   Durbin-Watson:                   1.263
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):              312.571
-Skew:                          -1.836   Prob(JB):                     1.34e-68
-Kurtosis:                      15.231   Cond. No.                         688.
+Omnibus:                      296.930   Durbin-Watson:                   1.410
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            15969.944
+Skew:                           3.670   Prob(JB):                         0.00
+Kurtosis:                      37.387   Cond. No.                         309.
 ==============================================================================
 
 Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
+
+------------ Dual Regression ------------
+Regression Equation: FVIX^2(t,t+3)-VIX^2(t+3;1) = -⍺ + (1-β)(FVIX^2(t,t+3)-VIX^2(t;1)) - e(t+3)                                OLS Regression Results                                
+======================================================================================
+Dep. Variable:     FVIX^2(t,t+3)-VIX^2(t+3;1)   R-squared:                       0.128
+Model:                                    OLS   Adj. R-squared:                  0.125
+Method:                         Least Squares   F-statistic:                     11.45
+Date:                        Wed, 26 Aug 2026   Prob (F-statistic):           0.000806
+Time:                                21:54:46   Log-Likelihood:                 1226.5
+No. Observations:                         310   AIC:                            -2449.
+Df Residuals:                             308   BIC:                            -2442.
+Df Model:                                   1                                         
+Covariance Type:                          HAC                                         
+============================================================================================
+                               coef    std err          z      P>|z|      [0.025      0.975]
+--------------------------------------------------------------------------------------------
+Intercept                    0.0002      0.000      0.725      0.468      -0.000       0.001
+FVIX^2(t,t+k+1)-VIX^2(t)     0.5470      0.162      3.384      0.001       0.230       0.864
+==============================================================================
+Omnibus:                      296.930   Durbin-Watson:                   1.410
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            15969.944
+Skew:                          -3.670   Prob(JB):                         0.00
+Kurtosis:                      37.387   Cond. No.                         309.
+==============================================================================
+
+Notes:
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
 
 ---- Dicrete HPR Version ----
 ----- Dual Regression -----
                             OLS Regression Results                            
 ==============================================================================
-Dep. Variable:             H_discrete   R-squared:                       0.112
-Model:                            OLS   Adj. R-squared:                  0.092
-Method:                 Least Squares   F-statistic:                     3.069
-Date:                Tue, 25 Aug 2026   Prob (F-statistic):             0.0868
-Time:                        01:25:19   Log-Likelihood:                 147.20
-No. Observations:                  46   AIC:                            -290.4
-Df Residuals:                      44   BIC:                            -286.7
+Dep. Variable:             H_discrete   R-squared:                       0.064
+Model:                            OLS   Adj. R-squared:                  0.061
+Method:                 Least Squares   F-statistic:                     12.85
+Date:                Wed, 26 Aug 2026   Prob (F-statistic):           0.000391
+Time:                        21:54:46   Log-Likelihood:                 1249.1
+No. Observations:                 310   AIC:                            -2494.
+Df Residuals:                     308   BIC:                            -2487.
 Df Model:                           1                                         
 Covariance Type:                  HAC                                         
 ==============================================================================
                  coef    std err          z      P>|z|      [0.025      0.975]
 ------------------------------------------------------------------------------
-const         -0.0033      0.004     -0.836      0.403      -0.011       0.005
-0              2.4133      1.378      1.752      0.080      -0.287       5.113
+const          0.0007      0.000      2.704      0.007       0.000       0.001
+0              0.3472      0.097      3.585      0.000       0.157       0.537
 ==============================================================================
-Omnibus:                       85.039   Durbin-Watson:                   1.002
-Prob(Omnibus):                  0.000   Jarque-Bera (JB):             1644.914
-Skew:                          -4.860   Prob(JB):                         0.00
-Kurtosis:                      30.636   Cond. No.                         688.
+Omnibus:                      276.168   Durbin-Watson:                   1.568
+Prob(Omnibus):                  0.000   Jarque-Bera (JB):            23838.135
+Skew:                          -3.058   Prob(JB):                         0.00
+Kurtosis:                      45.522   Cond. No.                         309.
 ==============================================================================
 
 Notes:
-[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 3 lags and without small sample correction
+[1] Standard Errors are heteroscedasticity and autocorrelation robust (HAC) using 5 lags and without small sample correction
 
