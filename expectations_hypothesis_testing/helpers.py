@@ -736,32 +736,33 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
 
                             fh.write(f"--- {v} {k+1} Month Regression ---\n")
                             fh.write(f"--------- Continuous HPR Version ---------\n")
-                            fh.write(f"{v}(t;1) has a 1-month maturity at time t\n")
-                            fh.write(f"{v}(t+{k+1};1) has a 1-month maturity at time t+{k+1}\n")
+                            fh.write(f"{v}(t;1) is 1-month E[Var] at time t\n")
+                            fh.write(f"{v}(t+{k+1};1) is 1-month E[Var] at time t+{k+1}\n")
                             fh.write(f"F{v}(t,t+{k+1}) = {v}(t+{k+1};1)-{v}(t;1)\n")
+                            #Primal:
                             fh.write(f"------------ Primal Regression ------------\n")
                             #Primal: VAR(t+k)-VAR(t) = a + b(FVAR(t,t+k+1)-VAR(t)) + e(t+k)
-                            fh.write(f"Regression Equation: {v}(t+{k+1};1)-{v}(t;1) = ⍺ + β(F{v}(t,t+{k+1})-{v}(t;1)) + e(t+{k+1})")
-                            #"""
+                            fh.write(f"Regression Equation: {v}(t+{k+1};1)-{v}(t;1) = ⍺ + β(F{v}(t,t+{k+1})-{v}(t;1)) + e(t+{k+1})\n")
                             y=data['VAR(t+k)']-data['VAR(t)']
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
                             ols_model = sm.OLS(y, x)
                             primal_ols_results= ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
-
                             fh.write(primal_ols_results.summary(yname=f'{v}(t+{k+1};1)-{v}(t;1)',xname=['Intercept',f'F{v}(t,t+k+1)-{v}(t)']).as_text())
                             fh.write("\n\n")
 
                             #Dual: 
                             fh.write(f"------------ Dual Regression ------------\n")
-                            fh.write(f"Regression Equation: F{v}(t,t+{k+1})-{v}(t+{k+1};1) = -⍺ + (1-β)(F{v}(t,t+{k+1})-{v}(t;1)) - e(t+{k+1})")
-
+                            fh.write(f"Regression Equation: F{v}(t,t+{k+1})-{v}(t+{k+1};1) = -⍺ + (1-β)(F{v}(t,t+{k+1})-{v}(t;1)) - e(t+{k+1})\n")
                             y=data['H']
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
                             ols_model = sm.OLS(y, x)
                             dual_ols_results = ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
-
                             fh.write(dual_ols_results.summary(yname=f'F{v}(t,t+{k+1})-{v}(t+{k+1};1)',xname=['Intercept',f'F{v}(t,t+k+1)-{v}(t)']).as_text())
                             fh.write("\n\n")
+
+                            fh.write(f"Sanity Check: \n")
+                            fh.write(f"Intercept: ⍺_prime+⍺_dual = {primal_ols_results.params['const']+dual_ols_results.params['const']} \n")
+                            fh.write(f"Slope: β_primal+β_dual-1 = {primal_ols_results.params[0]+dual_ols_results.params[0]-1} \n")
 
                             data['alpha_primal']=primal_ols_results.params['const']
                             data['beta_primal']=primal_ols_results.params[0]
@@ -772,10 +773,8 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             data['sum(a)']=primal_ols_results.params['const']+dual_ols_results.params['const']
                             data['sum(B)-1']=primal_ols_results.params[0]+dual_ols_results.params[0]-1
 
-                            
-
+                        
                             regression_stats[k][v]={}
-
                             regression_stats[k][v]['continuous']={'⍺_primal_coef':primal_ols_results.params['const'],
                                             '⍺_primal_Tstat':primal_ols_results.tvalues['const'],
                                             'β_primal_coef':primal_ols_results.params[0],
@@ -793,8 +792,11 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             #print('-------------------------')
 
 
-                            fh.write(f"---- Dicrete HPR Version ----\n")
-                            fh.write(f"----- Dual Regression -----\n")
+                            fh.write(f"--------- Dicrete HPR Version ---------\n")
+                            fh.write(f"------------ Dual Regression ------------\n")
+                            #data['H_discrete']=data[f'{k+1} month {v} liquidation']-data[f'{k} month {v} payoff']-(data[f'{k+1} month {v}']-data[f'{k} month {v}'])
+                            #data['H_discrete']*=-1
+                            fh.write(f"Regression Equation: -[ Price({k+1}mo. {v}) - Payoff({k}mo. {v}) - [{v}(t+{k+1};1)-{v}(t;1)] ] = -⍺ + (1-β)(F{v}(t,t+{k+1})-{v}(t;1)) - e(t+{k+1})\n")
 
                             y=data['H_discrete']
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
@@ -851,7 +853,6 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
     else:
         var_regression_df.to_csv('expectations_hypothesis_testing/outputs/variance_expecthypoth_results.csv')
 
-    #var_regression_df#.iloc[:,-3:]
 
 
 
