@@ -738,7 +738,8 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             fh.write(f"--------- Continuous HPR Version ---------\n")
                             fh.write(f"{v}(t;1) is 1-month E[Var] at time t\n")
                             fh.write(f"{v}(t+{k+1};1) is 1-month E[Var] at time t+{k+1}\n")
-                            fh.write(f"F{v}(t,t+{k+1}) = {v}(t+{k+1};1)-{v}(t;1)\n")
+                            fh.write(f"{v}(t;{k+1}) is {k+1}-month E[Var] at time t\n")
+                            fh.write(f"F{v}(t,t+{k+1}) = {v}(t;{k+1})-{v}(t;{k})\n")
                             #Primal:
                             fh.write(f"------------ Primal Regression ------------\n")
                             #Primal: VAR(t+k)-VAR(t) = a + b(FVAR(t,t+k+1)-VAR(t)) + e(t+k)

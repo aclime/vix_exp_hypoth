@@ -2,7 +2,8 @@
 --------- Continuous HPR Version ---------
 VIX^2(t;1) is 1-month E[Var] at time t
 VIX^2(t+2;1) is 1-month E[Var] at time t+2
-FVIX^2(t,t+2) = VIX^2(t+2;1)-VIX^2(t;1)
+VIX^2(t;2) is 2-month E[Var] at time t
+FVIX^2(t,t+2) = VIX^2(t;2)-VIX^2(t;1)
 ------------ Primal Regression ------------
 Regression Equation: VIX^2(t+2;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+2)-VIX^2(t;1)) + e(t+2)
                                OLS Regression Results                              
@@ -10,8 +11,8 @@ Regression Equation: VIX^2(t+2;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+2)-VIX^2(t;1)
 Dep. Variable:     VIX^2(t+2;1)-VIX^2(t;1)   R-squared:                       0.025
 Model:                                 OLS   Adj. R-squared:                  0.022
 Method:                      Least Squares   F-statistic:                     6.677
-Date:                     Thu, 27 Aug 2026   Prob (F-statistic):             0.0102
-Time:                             20:08:33   Log-Likelihood:                 1286.7
+Date:                     Fri, 28 Aug 2026   Prob (F-statistic):             0.0102
+Time:                             14:51:02   Log-Likelihood:                 1286.7
 No. Observations:                      311   AIC:                            -2569.
 Df Residuals:                          309   BIC:                            -2562.
 Df Model:                                1                                         
@@ -38,8 +39,8 @@ Regression Equation: FVIX^2(t,t+2)-VIX^2(t+2;1) = -⍺ + (1-β)(FVIX^2(t,t+2)-VI
 Dep. Variable:     FVIX^2(t,t+2)-VIX^2(t+2;1)   R-squared:                       0.098
 Model:                                    OLS   Adj. R-squared:                  0.096
 Method:                         Least Squares   F-statistic:                     28.50
-Date:                        Thu, 27 Aug 2026   Prob (F-statistic):           1.82e-07
-Time:                                20:08:33   Log-Likelihood:                 1286.7
+Date:                        Fri, 28 Aug 2026   Prob (F-statistic):           1.82e-07
+Time:                                14:51:02   Log-Likelihood:                 1286.7
 No. Observations:                         311   AIC:                            -2569.
 Df Residuals:                             309   BIC:                            -2562.
 Df Model:                                   1                                         
@@ -70,8 +71,8 @@ Regression Equation: -[ Price(2mo. VIX^2) - Payoff(1mo. VIX^2) - [VIX^2(t+2;1)-V
 Dep. Variable:             H_discrete   R-squared:                       0.004
 Model:                            OLS   Adj. R-squared:                  0.001
 Method:                 Least Squares   F-statistic:                    0.8100
-Date:                Thu, 27 Aug 2026   Prob (F-statistic):              0.369
-Time:                        20:08:33   Log-Likelihood:                 1219.8
+Date:                Fri, 28 Aug 2026   Prob (F-statistic):              0.369
+Time:                        14:51:02   Log-Likelihood:                 1219.8
 No. Observations:                 311   AIC:                            -2436.
 Df Residuals:                     309   BIC:                            -2428.
 Df Model:                           1                                         
@@ -95,7 +96,8 @@ Notes:
 --------- Continuous HPR Version ---------
 VIX^2(t;1) is 1-month E[Var] at time t
 VIX^2(t+3;1) is 1-month E[Var] at time t+3
-FVIX^2(t,t+3) = VIX^2(t+3;1)-VIX^2(t;1)
+VIX^2(t;3) is 3-month E[Var] at time t
+FVIX^2(t,t+3) = VIX^2(t;3)-VIX^2(t;2)
 ------------ Primal Regression ------------
 Regression Equation: VIX^2(t+3;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+3)-VIX^2(t;1)) + e(t+3)
                                OLS Regression Results                              
@@ -103,8 +105,8 @@ Regression Equation: VIX^2(t+3;1)-VIX^2(t;1) = ⍺ + β(FVIX^2(t,t+3)-VIX^2(t;1)
 Dep. Variable:     VIX^2(t+3;1)-VIX^2(t;1)   R-squared:                       0.091
 Model:                                 OLS   Adj. R-squared:                  0.088
 Method:                      Least Squares   F-statistic:                     7.853
-Date:                     Thu, 27 Aug 2026   Prob (F-statistic):            0.00540
-Time:                             20:08:33   Log-Likelihood:                 1226.5
+Date:                     Fri, 28 Aug 2026   Prob (F-statistic):            0.00540
+Time:                             14:51:02   Log-Likelihood:                 1226.5
 No. Observations:                      310   AIC:                            -2449.
 Df Residuals:                          308   BIC:                            -2442.
 Df Model:                                1                                         
@@ -131,8 +133,8 @@ Regression Equation: FVIX^2(t,t+3)-VIX^2(t+3;1) = -⍺ + (1-β)(FVIX^2(t,t+3)-VI
 Dep. Variable:     FVIX^2(t,t+3)-VIX^2(t+3;1)   R-squared:                       0.128
 Model:                                    OLS   Adj. R-squared:                  0.125
 Method:                         Least Squares   F-statistic:                     11.45
-Date:                        Thu, 27 Aug 2026   Prob (F-statistic):           0.000806
-Time:                                20:08:33   Log-Likelihood:                 1226.5
+Date:                        Fri, 28 Aug 2026   Prob (F-statistic):           0.000806
+Time:                                14:51:02   Log-Likelihood:                 1226.5
 No. Observations:                         310   AIC:                            -2449.
 Df Residuals:                             308   BIC:                            -2442.
 Df Model:                                   1                                         
@@ -163,8 +165,8 @@ Regression Equation: -[ Price(3mo. VIX^2) - Payoff(2mo. VIX^2) - [VIX^2(t+3;1)-V
 Dep. Variable:             H_discrete   R-squared:                       0.064
 Model:                            OLS   Adj. R-squared:                  0.061
 Method:                 Least Squares   F-statistic:                     12.85
-Date:                Thu, 27 Aug 2026   Prob (F-statistic):           0.000391
-Time:                        20:08:33   Log-Likelihood:                 1249.1
+Date:                Fri, 28 Aug 2026   Prob (F-statistic):           0.000391
+Time:                        14:51:02   Log-Likelihood:                 1249.1
 No. Observations:                 310   AIC:                            -2494.
 Df Residuals:                     308   BIC:                            -2487.
 Df Model:                           1                                         
