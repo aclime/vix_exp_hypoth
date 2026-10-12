@@ -206,6 +206,11 @@ def get_sp500_file():
     #return yf_df
 
 
+#changing
+# AND date < '{liquid_date.strftime('%Y-%m-%d')}'
+# To
+# AND date <= '{liquid_date.strftime('%Y-%m-%d')}'
+
 def option_liquidation_query(tick,option_ids,liquid_date):
     """
     get prices for a list of optionids on a day provided
@@ -230,7 +235,7 @@ def option_liquidation_query(tick,option_ids,liquid_date):
     FROM optionm.opprcd{liquid_date.year} AS tbl 
     WHERE secid = {sec_id_map.get(tick)}
         AND optionid in {tuple([int(i) for i in option_ids])}
-        AND date < '{liquid_date.strftime('%Y-%m-%d')}'
+        AND date <= '{liquid_date.strftime('%Y-%m-%d')}'
     ORDER BY optionid, date DESC;
     """
 
