@@ -682,6 +682,504 @@ def compute_option_portfolios(num_periods_wanted=3,lb_year=1998,ub_year=2023,tic
 
 
 
+def formula_checks(monthly_portfolios,option_portfolios):
+
+    data = monthly_portfolios.copy()
+    data['Trade Date']=pd.to_datetime(data['Trade Date'])
+    data['modified_trade_date']=pd.to_datetime(data['modified_trade_date'])#.dt.date
+    #data=data[data['modified_trade_date'].dt.year>=2000]
+    #print(data['modified_trade_date'].dt.year)
+    k=1
+    v='VIX^2'
+
+    #liquidating the 2-month portfolio after holdign for 1-month
+    opt_liquidation=data[f'2 month {v} liquidation']
+    #payoff realized on the near-leg
+    opt_payoff=data[f'1 month {v} payoff']
+    #payoff on a forward contract
+    fwd_payoff=data[f'1 month S_T']/data[f'1 month F']-1
+    #The evaluation of the put-call parity integral between forward levels, eq (55)/(56):
+    #F_tau,T/F0,T - 1 - log(F_tau,T/F0,T). No exponential belongs on this term -- in eq (55)/(56)
+    #it is derived carrying an e^{-r_tau,T(T-tau)} factor, but that factor is exactly what cancels
+    #when eq (39) is combined with eq (55)/(56) to isolate (T-tau)*VIX^2_tau(T-tau) (see eq A below).
+    pcp_approx=data[f'1 month F'].shift(-1)/data[f'2 month F']-1-np.log(data[f'1 month F'].shift(-1).astype(float)/data[f'2 month F'].astype(float))
+    #r_{0,T} and T for the 2-month leg established at time 0 (the rate baked into
+    #`VIX_square_opt_weight`/opt_liquidation at portfolio-formation time in compute_option_portfolios)
+    r_0T=data['2 month interest rate'].astype(float)
+    T_mat=data['2 month t'].astype(float)
+    #r_{tau,T} and (T-tau): the rate/maturity of the NEXT row's 1-month leg, which approximates the
+    #forward rate/remaining-maturity observed at time tau (one month from now) for the 2-month leg's
+    #expiration T, since portfolios roll forward ~1 month at a time
+    r_tauT=data['1 month interest rate'].shift(-1).astype(float)
+    tau_mat=data['1 month t'].shift(-1).astype(float)
+    #opt_liquidation = 2*e^{r_0T*T}*I_tau(F0,T split) (the e^{r_0T*T} factor is fixed at formation time
+    #and has no business multiplying time-tau prices -- combining eq (39) with eq (55)/(56) requires an
+    #e^{r_tau,T*(T-tau)} factor instead). Rescale to remove the wrong factor and apply the correct one.
+    rescale_factor=np.exp(r_tauT*tau_mat-r_0T*T_mat)
+
+    fwd_payoff_longTerm=data[f'1 month S_T']/data[f'2 month F']-1
+
+    r_0tau=data['1 month interest rate'].astype(float)
+    
+    with PdfPages('expectations_hypothesis_testing/outputs/formula_testing.pdf') as pdf:
+
+        #Option Payoff + Fwd Payoff = log return
+        data['log_actual']=np.log(data[f'{k} month S_T']/data[f'{k} month F'])
+        data['log_approx']=2*fwd_payoff-opt_payoff
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['log_approx'],label=r'$S_T/F-1 - \int_0^F (K-S_T)^+/K^2 dK - \int_F^\infty (S_T-F)^+/K^2 dK$',alpha=0.6)
+        plt.plot(data['Trade Date'],2*data['log_actual'],label=r'$2log(S_T/F)+2(S_T/F-1)$',alpha=0.6)
+        plt.legend()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([2*data['log_actual'],data['log_approx']],axis=1).corr() 
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([2*data['log_actual'],data['log_approx']],axis=1).describe().round(6)
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        #------------------------------------
+
+        #Liquidation + pcp = Future VIX^2
+        #eq A: (T-tau)*VIX^2_tau(T-tau) = 2*e^{r_tau,T*(T-tau)}*I_tau(F0,T split) - 2*[F_tau,T/F0,T - 1 - log(F_tau,T/F0,T)]
+        #opt_liquidation = 2*e^{r_0,T*T}*I_tau(F0,T split), so rescale by e^{r_tau,T*(T-tau) - r_0,T*T}
+        #to get 2*e^{r_tau,T*(T-tau)}*I_tau(F0,T split) before subtracting off the (unscaled) pcp term.
+        data['approximation']=(opt_liquidation*rescale_factor)-2*pcp_approx
+        data['future_VIX^2']=(data[f'1 month {v}']).shift(-1)
+        """
+        plt.figure(figsize=(10, 6))
+        a=0.6
+        plt.plot(data['Trade Date'],data['approximation'],label=r'$2e^{r_{\tau,T}(T-\tau)} \{ \int_0^{F_{0,T}} P_\tau(K,T)/K^2 dK + \int_{F_{0,T}}^\infty C_\tau(K,T)/K^2 dK \} - 2[F_{\tau,T}/F_{0,T}-1-\log(F_{\tau,T}/F_{0,T})]$',alpha=a)
+        plt.plot(data['Trade Date'],data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center', ncol=2)
+        plt.tight_layout()
+        #plt.legend()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation'],data['future_VIX^2']],axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation'],data['future_VIX^2']],axis=1).describe().round(6)
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        """
+        #------------------------------------
+
+        #Liquidation + near-leg payoff + both forward hedges + known-rate bond hedge = Future VIX^2 (eq 59)
+        #eq 59 adds the forward hedge on the FAR leg (-2*(S_tau-F0,T)/F0,T = -2*fwd_payoff_longTerm) that eq 58
+        #left out, on top of the near leg's own realized payoff (-opt_payoff) and its own forward hedge
+        #(+2*fwd_payoff). This leaves a residual of 2*(1-e^{-r_tau,T(T-tau)}) [+ small log/rate terms].
+        #That residual can't be cancelled for free -- any self-financing bond/money-market trade sized
+        #using the REALIZED r_tau,T nets to exactly zero by no-arbitrage. But it CAN be partially hedged
+        #using only information available at time 0: buy (today) a tau-maturity zero-coupon bond whose
+        #face value is set using the FORWARD rate for [tau,T] implied by TODAY's yield curve,
+        #   f_{0,tau,T} = (r_0,T*T - r_0,tau*tau) / (T-tau)
+        #so its known-today payoff 2*(1-e^{-f_{0,tau,T}(T-tau)}) is our best estimate of the term being
+        #removed. This costs a small, known amount at time 0 (Pi_0 is no longer exactly the zero-cost
+        #replicating portfolio), and it leaves behind only the interest-rate SURPRISE
+        #2*[e^{-f_{0,tau,T}(T-tau)} - e^{-r_tau,T(T-tau)}] -- month-to-month rate surprises are typically
+        #much smaller than the rate level itself, so this should shrink (not eliminate) the residual.
+        #Pi_tau_raw = I_tau(F0,T split) - (near-leg payoff) + 2*fwd_payoff - 2*fwd_payoff_longTerm, scaled by
+        #e^{r_tau,T(T-tau)} the same way opt_liquidation is (via rescale_factor) to land in (T-tau)*VIX^2 units.
+        tau_mat_0=data['1 month t'].astype(float)
+        fwd_len=T_mat-tau_mat_0
+        f_0tauT=(r_0T*T_mat-r_0tau*tau_mat_0)/fwd_len
+        known_rate_hedge=2*(1-np.exp(-f_0tauT*fwd_len))
+        data['approximation_full_hedge']=opt_liquidation*rescale_factor + (2*fwd_payoff-opt_payoff-2*fwd_payoff_longTerm)*np.exp(r_tauT*tau_mat) #- known_rate_hedge
+        plt.figure(figsize=(10, 6))
+        a=0.6
+        plt.plot(data['Trade Date'],data['approximation_full_hedge'],
+                 label=r'$\Pi_\tau$ (eq 59, both fwd hedges, rescaled',alpha=a)
+        plt.plot(data['Trade Date'],data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center', ncol=2)
+        plt.tight_layout()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation_full_hedge'],data['future_VIX^2']],axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation_full_hedge'],data['future_VIX^2']],axis=1).describe().round(6)
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        #------------------------------------
+        #Liquidation + option substitution = Future VIX^2
+        #Instead of invoking the closed-form put-call parity result (eq 55/56), directly substitute
+        #real option quotes across the two portfolios to build a discrete version of
+        #   Case 1 (F0,T < Ftau,T): 2 * sum_{K in (F0,T,Ftau,T)} dK/K^2 * (C_tau(K,T) - P_tau(K,T))
+        #   Case 2 (F0,T > Ftau,T): 2 * sum_{K in (Ftau,T,F0,T)} dK/K^2 * (P_tau(K,T) - C_tau(K,T))
+        #C_tau(K,T) for strikes above F0,T comes from liquidating the ORIGINAL 2-month portfolio's calls
+        #(formed OTM around F0,T at time 0; liquidation_midprice reprices them at time tau). P_tau(K,T)
+        #for the same strikes comes from the NEXT row's freshly-formed 1-month portfolio's own OTM puts
+        #(that portfolio is formed at time tau, so its own midpoint_price already IS the time-tau price)
+        #-- and symmetrically for case 2. No put-call parity formula is invoked; strikes that aren't
+        #listed in both portfolios simply drop out of the sum, which also reveals how much of the
+        #theoretical strike range is actually spanned by real, overlapping quotes.
+        op=option_portfolios.copy()
+        op['trade_date']=pd.to_datetime(op['trade_date'])
+        op['maturity_id']=op['maturity_id'].astype(int)
+        op_groups={key:grp for key,grp in op.groupby(['trade_date','maturity_id'])}
+
+        sub_sum=[]
+        sub_weight_matched=[]
+        sub_weight_total=[]
+        for i in range(len(data)):
+            F0T=data[f'2 month F'].iloc[i] if i<len(data) else np.nan
+            FtauT=data[f'1 month F'].iloc[i+1] if i+1<len(data) else np.nan
+            if i+1>=len(data) or pd.isnull(F0T) or pd.isnull(FtauT):
+                sub_sum.append(np.nan); sub_weight_matched.append(np.nan); sub_weight_total.append(np.nan)
+                continue
+            orig_key=(data['Trade Date'].iloc[i],2)
+            next_key=(data['Trade Date'].iloc[i+1],1)
+            if orig_key not in op_groups or next_key not in op_groups:
+                sub_sum.append(np.nan); sub_weight_matched.append(np.nan); sub_weight_total.append(np.nan)
+                continue
+            orig=op_groups[orig_key]
+            nxt=op_groups[next_key]
+            if F0T<FtauT:
+                #Case 1: substitute puts from the next portfolio in for the original OTM calls,
+                #restricted to the (F0,T, Ftau,T) integration range
+                orig_side=orig[(orig.cp_flag=='C')&(orig.strike_price<FtauT)][['strike_price','dK','liquidation_midprice']]
+                next_side=nxt[nxt.cp_flag=='P'][['strike_price','midpoint_price']]
+            elif F0T>FtauT:
+                #Case 2: substitute calls from the next portfolio in for the original OTM puts,
+                #restricted to the (Ftau,T, F0,T) integration range
+                orig_side=orig[(orig.cp_flag=='P')&(orig.strike_price>FtauT)][['strike_price','dK','liquidation_midprice']]
+                next_side=nxt[nxt.cp_flag=='C'][['strike_price','midpoint_price']]
+            else:
+                sub_sum.append(0.0); sub_weight_matched.append(0.0); sub_weight_total.append(0.0)
+                continue
+
+            matched=orig_side.merge(next_side,on='strike_price',how='inner')
+            weight=matched['dK']/(matched['strike_price']**2)
+            #(liquidation_midprice - midpoint_price) is (C_tau-P_tau) in case 1 and (P_tau-C_tau) in case 2,
+            #matching the sign convention of eq (45)/(46) in both cases
+            sub_sum.append( 2.0*(weight*(matched['liquidation_midprice']-matched['midpoint_price'])).sum() )
+            sub_weight_matched.append(weight.sum())
+            sub_weight_total.append((orig_side['dK']/(orig_side['strike_price']**2)).sum())
+
+        data['option_substitution_sum']=sub_sum
+        data['option_substitution_coverage']=pd.Series(sub_weight_matched,index=data.index)/pd.Series(sub_weight_total,index=data.index)
+
+        #option_substitution_sum is the discrete analog of 2*e^{-r_tau,T(T-tau)}*pcp_approx (eq 45/46's RHS,
+        #WITH the exponential baked in), so it plays the same role as `2*pcp_approx*exp(-r_tauT*tau_mat)` did
+        #in the earlier closed-form check -- multiply by e^{+r_tau,T(T-tau)} to match the e^{r_tau,T(T-tau)}
+        #scaling already applied to opt_liquidation via rescale_factor.
+        data['approximation_substitution']=(opt_liquidation*rescale_factor)-data['option_substitution_sum']*np.exp(r_tauT*tau_mat)
+
+        plt.figure(figsize=(10, 6))
+        a=0.6
+        plt.plot(data['Trade Date'],data['approximation_substitution'],
+                 label=r'$2e^{r_{\tau,T}(T-\tau)}I_\tau(F_{0,T}\text{split}) - 2e^{r_{\tau,T}(T-\tau)}\sum \Delta K/K^2 (C_\tau(K,T)-P_\tau(K,T))$',alpha=a)
+        plt.plot(data['Trade Date'],data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center', ncol=2)
+        plt.tight_layout()
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation_substitution'],data['future_VIX^2']],axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['approximation_substitution'],data['future_VIX^2']],axis=1).describe().round(6)
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+        #diagnostic: how much of the case 1/2 strike range is actually spanned by strikes that are
+        #listed in BOTH portfolios (matched), vs. only ever listed in the original one (total)
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=data[['option_substitution_coverage']].describe().round(4)
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+
+
+
+        #OLD
+        #Portfolio Value vs Future VIX^2
+        #Liquidation - Option Payoff + Fwd Payoff = Liquidation + log payoff
+        #"""
+        data['raw_portf_value']=opt_liquidation-2*fwd_payoff_longTerm+data['log_approx']
+        data['portf_aprrox_value_4']=( np.exp(-r_tauT*tau_mat)*data['future_VIX^2']
+                                    +2*(data[f'1 month S_T']/data['2 month F']-np.exp(-r_tauT*tau_mat))
+                                    -2*fwd_payoff_longTerm
+                                    +2*(1-np.exp(-r_tauT*tau_mat) )*np.log(data[f'1 month S_T']/data[f'1 month F'])
+                                    -2*np.exp(-r_tauT*tau_mat)*(r_0tau*tau_mat_0 + r_tauT*tau_mat - r_0T*T_mat ) )
+        #data['raw_portf_value']=opt_liquidation-2*fwd_payoff_longTerm+2*data['log_actual']
+        #data['log_approx']=2*fwd_payoff-opt_payoff
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2 \{ \int_0^{F_{0,T}} P_\tau(K,T)/K^2 dK + \int_{F_{0,T}}^\infty C_\tau(K,T)/K^2 dK \} + 2S_T/F_{0,\tau}-1 - \int_0^{F_{0,\tau}} (K-S_T)^+/K^2 dK - \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK$',alpha=0.6)
+        #plt.plot(data['Trade Date'],np.exp(-r_tauT*(T_mat-tau_mat))*data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.plot(data['Trade Date'],data['portf_aprrox_value_4'],label=r'$Eq. 59 ending$',alpha=a)
+        plt.title('Ultimate (OLD)')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['raw_portf_value'],
+                           #np.exp(-r_tauT*(T_mat-tau_mat))*data['future_VIX^2'],
+                           data['portf_aprrox_value_4'] ],
+                           axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        #"""
+        #------------------------------------
+
+
+
+
+        #------------------------------------
+        #NEW
+        #Portfolio Value vs Future VIX^2
+        #Liquidation - Option Payoff + Fwd Payoff = Liquidation + log payoff
+        #"""
+        F_0T=data['2 month F'].astype(float)    
+        F_tauT=data['1 month F'].shift(-1).astype(float)
+        F_0tau=data['1 month F'].astype(float)
+        fwd_value_long_term = np.exp(-r_tauT*tau_mat)*(F_tauT/F_0T-1)
+
+        a_weight = F_0T/F_0tau * np.exp(-r_0T*T_mat) #liquidition is multiplied by 2e^{r_{0,T}T}
+        b_weight = 2* F_0T/F_0tau
+        #c_weight=2, d_weight=1 are not applied separately below -- data['log_approx']=2*fwd_payoff-opt_payoff
+        #(opt_payoff already carries its own factor of 2) already reduces, via Carr-Madan, to exactly
+        #2*log(S_tau/F_{0,tau}), which is the c=d=2 near-leg combination derived for this weight set.
+
+        #rate surprise delta = r_{0,tau}*tau + r_{tau,T}*(T-tau) - r_{0,T}*T: the gap between the realized
+        #tau-to-T rate and what today's (time-0) forward curve implied. F_0T/F_0tau*exp(-r_tauT*tau_mat)
+        #collapses to exp(-rate_surprise) exactly (ratio of today's forwards times the realized discount
+        #factor), which is what should multiply future_VIX^2 below -- not exp(-r_tauT*tau_mat) alone.
+        rate_surprise = r_0tau*tau_mat_0 + r_tauT*tau_mat - r_0T*T_mat
+
+        data['raw_portf_value']=a_weight*opt_liquidation - b_weight*fwd_value_long_term + data['log_approx']
+        #Exact target: e^{-delta}*(T-tau)*VIX^2_tau(T-tau) + 2*(1-e^{-delta})*log(S_tau/F_{0,tau}) - 2*delta*e^{-delta}.
+        #This should match raw_portf_value as an algebraic identity (up to data noise), not just approximately --
+        #it vanishes to the plain (T-tau)*VIX^2_tau(T-tau) exactly when rate_surprise=0.
+        #data['portf_aprrox_value_4']=( np.exp(-rate_surprise)*data['future_VIX^2']
+        #                             + 2*(1-np.exp(-rate_surprise))*data['log_actual']
+        #                             - 2*rate_surprise*np.exp(-rate_surprise)
+        #                             )
+        data['portf_aprrox_value_1']=a_weight*opt_liquidation - b_weight*fwd_value_long_term + 2*data['log_actual']
+        #data['raw_portf_value']=opt_liquidation-2*fwd_payoff_longTerm+2*data['log_actual']
+        #data['log_approx']=2*fwd_payoff-opt_payoff
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2\frac{F_{0,T}}{F_{0,\tau}} \{ \int_0^{F_{0,T}} \frac{1}{K^2}P_{\tau}(K,T)dK + \int_{F_{0,T}}^\infty \frac{1}{K^2}C_{\tau}(K,T)dK \} - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}}  - 2\{ \int_0^{F_{0,\tau}} \frac{1}{K^2}(K-S_T)^+ dK + \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK \} + 2( S_\tau/F_{0,\tau}-1)$',alpha=0.6)
+        plt.plot(data['Trade Date'],data['portf_aprrox_value_1'],label=r'$2\frac{F_{0,T}}{F_{0,\tau}} \{ \int_0^{F_{0,T}} \frac{1}{K^2}P_{\tau}(K,T)dK + \int_{F_{0,T}}^\infty \frac{1}{K^2}C_{\tau}(K,T)dK \} - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}} + 2\log(S_\tau/F_{0,\tau}) $',alpha=a)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_4'],label=r'$e^{-\delta}(T-\tau)VIX^2_\tau(T-\tau)+2(1-e^{-\delta})\log(S_\tau/F_{0,\tau})-2\delta e^{-\delta}$',alpha=a)
+        plt.title('Check 1: log approximation')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+
+        data['portf_aprrox_value_2']= ( a_weight*(np.exp(-r_tauT*tau_mat)*data['future_VIX^2'])
+                                       +2*a_weight * np.exp(-r_tauT*tau_mat)*(F_tauT/F_0T-1-np.log(F_tauT/F_0T) ) 
+                                       - b_weight*fwd_value_long_term 
+                                       + 2*data['log_actual'] )
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2\frac{F_{0,T}}{F_{0,\tau}} \{ \int_0^{F_{0,T}} \frac{1}{K^2}P_{\tau}(K,T)dK + \int_{F_{0,T}}^\infty \frac{1}{K^2}C_{\tau}(K,T)dK \} - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}}  - 2\{ \int_0^{F_{0,\tau}} \frac{1}{K^2}(K-S_T)^+ dK + \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK \} + 2( S_\tau/F_{0,\tau}-1)$',alpha=0.6)
+        plt.plot(data['Trade Date'],data['portf_aprrox_value_2'],label=r'$\frac{F_{0,T}}{F_{0,\tau}} \cdot (T-\tau)\cdot e^{-r_{\tau,T}(T-\tau)} VIX^2_{\tau}(T-\tau) + 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} [\frac{F_{\tau,T}-F_{0,T}}{F_{0,T}} - \log(F_{\tau,T}/F_{0,T})] - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}} + 2\log(\frac{S_\tau}{F_{0,\tau}}) $',alpha=a)
+        plt.title('Check 2: Put-Call Parity Approximation')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+
+        data['portf_aprrox_value_3']= ( a_weight*(np.exp(-r_tauT*tau_mat)*data['future_VIX^2'])
+                                        -2*a_weight * np.exp(-r_tauT*tau_mat)* np.log(F_tauT/F_0T)   
+                                        + 2*data['log_actual'] )
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2\frac{F_{0,T}}{F_{0,\tau}} \{ \int_0^{F_{0,T}} \frac{1}{K^2}P_{\tau}(K,T)dK + \int_{F_{0,T}}^\infty \frac{1}{K^2}C_{\tau}(K,T)dK \} - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}}  - 2\{ \int_0^{F_{0,\tau}} \frac{1}{K^2}(K-S_T)^+ dK + \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK \} + 2( S_\tau/F_{0,\tau}-1)$',alpha=0.6)
+        plt.plot(data['Trade Date'],data['portf_aprrox_value_3'],label=r'$\frac{F_{0,T}}{F_{0,\tau}} \cdot (T-\tau)\cdot e^{-r_{\tau,T}(T-\tau)} VIX^2_{\tau}(T-\tau) - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \log(F_{\tau,T}/F_{0,T}) + 2\log(\frac{S_\tau}{F_{0,\tau}}) $',alpha=a)
+        plt.title('Check 3: Cancelling Terms')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        S_tau = data['1 month S_T'].astype(float)
+        data['portf_aprrox_value_4']= ( (np.exp(r_0T*T_mat)/np.exp(r_0tau*tau_mat) )*(np.exp(-r_tauT*tau_mat)*data['future_VIX^2'])
+                                        -2*(np.exp(r_0T*T_mat)/np.exp(r_0tau*tau_mat) ) * np.exp(-r_tauT*tau_mat)* np.log(S_tau*np.exp(r_tauT*tau_mat)/F_0T)   
+                                        + 2*data['log_actual'] )
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2\frac{F_{0,T}}{F_{0,\tau}} \{ \int_0^{F_{0,T}} \frac{1}{K^2}P_{\tau}(K,T)dK + \int_{F_{0,T}}^\infty \frac{1}{K^2}C_{\tau}(K,T)dK \} - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \cdot \frac{F_{\tau,T}-F_{0,T}}{F_{0,T}}  - \int_0^{F_{0,\tau}} (K-S_T)^+/K^2 dK - 2\{ \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK \} + 2\frac{S_\tau}{F_{0,\tau}}-1$',alpha=0.6)
+        plt.plot(data['Trade Date'],data['portf_aprrox_value_4'],label=r'$\frac{F_{0,T}}{F_{0,\tau}} \cdot (T-\tau)\cdot e^{-r_{\tau,T}(T-\tau)} VIX^2_{\tau}(T-\tau) - 2e^{-r_{\tau,T}(T-\tau)}\frac{F_{0,T}}{F_{0,\tau}} \log(F_{\tau,T}/F_{0,T}) + 2\log(\frac{S_\tau}{F_{0,\tau}}) $',alpha=a)
+        plt.title('Check 4: Substituting Fwd-Spot')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+
+        """
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['raw_portf_value'],
+                           #np.exp(-r_tauT*(T_mat-tau_mat))*data['future_VIX^2'],
+                           data['portf_aprrox_value_4'] ],
+                           axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        """
+        #------------------------------------
+
+
+
+
+
+
+
+
+
+
+        #Eq. (59) 
+        #Liquidation - Option Payoff + Fwd Payoff = Liquidation + log payoff
+        #data['raw_portf_value']=opt_liquidation+data['log_approx']
+        #adding forward hedge to liquidation
+        #"""
+        data['raw_portf_value']=opt_liquidation-2*fwd_payoff_longTerm+data['log_approx']
+        data['raw_portf_value'] -= 2*(1-np.exp(-r_tauT*tau_mat) )
+        data['portf_aprrox_value_1']=opt_liquidation-2*fwd_payoff_longTerm+2*data['log_actual']
+        data['portf_aprrox_value_2']=(data['future_VIX^2']+data['option_substitution_sum']*np.exp(r_tauT*tau_mat))-2*fwd_payoff_longTerm+2*data['log_actual']
+        data['portf_aprrox_value_3']=(data['future_VIX^2']+2*pcp_approx)-2*fwd_payoff_longTerm+2*data['log_actual']
+        data['portf_aprrox_value_4']=( np.exp(-r_tauT*tau_mat)*data['future_VIX^2']
+                                +2*(data[f'1 month S_T']/data['2 month F']-np.exp(-r_tauT*tau_mat))
+                                -2*fwd_payoff_longTerm
+                                +2*(1-np.exp(-r_tauT*tau_mat) )*np.log(data[f'1 month S_T']/data[f'1 month F'])
+                                -2*np.exp(-r_tauT*tau_mat)*(r_0tau*tau_mat_0 + r_tauT*tau_mat - r_0T*T_mat ) )
+        #_5: same pcp term as _3 (F_tau,T/F0,T kept real in the linear "-1" part), but the log() argument
+        #uses the theoretical S,r substitution instead of the real F_tau,T/F0,T ratio -- isolates whether
+        #the dividend gap found earlier matters more through the linear term or the log term.
+        S0_approx=data['1 month S_T'].shift(1)
+        theoretical_ratio=(data['1 month S_T']*np.exp(r_tauT*tau_mat))/(S0_approx*np.exp(r_0T*T_mat))
+        pcp_hybrid=data['1 month F'].shift(-1)/data['2 month F']-1-np.log(theoretical_ratio)
+        data['portf_aprrox_value_5']=(data['future_VIX^2']+2*pcp_hybrid)-2*fwd_payoff_longTerm+2*data['log_actual']
+        #data['approximation_substitution']=(opt_liquidation*rescale_factor)-data['option_substitution_sum']*np.exp(r_tauT*tau_mat)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],data['raw_portf_value'],label=r'$2 \{ \int_0^{F_{0,T}} P_\tau(K,T)/K^2 dK + \int_{F_{0,T}}^\infty C_\tau(K,T)/K^2 dK \} -2[ (S_\tau-F_{0,T})/F_{0,T} ] + 2S_T/F_{0,\tau}-1 - \int_0^{F_{0,\tau}} (K-S_T)^+/K^2 dK - \int_{F_{0,\tau}}^\infty (S_T-K)^+/K^2 dK$',alpha=0.6)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_1'],label=r'$2 \{ \int_0^{F_{0,T}} P_\tau(K,T)/K^2 dK + \int_{F_{0,T}}^\infty C_\tau(K,T)/K^2 dK \} + 2\log(S_T/F_{0,\tau}-1)$',alpha=a)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_2'],label=r'$2 \{ ... \} $',alpha=a)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_3'],label=r'$eval integral$',alpha=a)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_4'],label=r'$rearrange$',alpha=a)
+        #plt.plot(data['Trade Date'],data['portf_aprrox_value_5'],label=r'$eval integral, theoretical log$',alpha=a)
+        plt.plot(data['Trade Date'],np.exp(-r_tauT*tau_mat)*data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.title('Eq. 59')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+        fig, ax = plt.subplots(figsize=(6, 2))
+        ax.axis('tight'); ax.axis('off')
+        plot_df=pd.concat([data['raw_portf_value'],
+                           #data['portf_aprrox_value_1'],
+                           #data['portf_aprrox_value_2'],
+                           #data['portf_aprrox_value_3'],
+                           #data['portf_aprrox_value_4'],
+                           #data['portf_aprrox_value_5'],
+                           np.exp(-r_tauT*tau_mat)*data['future_VIX^2']
+                           ],axis=1).corr()
+        ax.table(cellText=plot_df.values, colLabels=plot_df.columns, cellLoc='center', loc='center')
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close()
+        #"""
+        #------------------------------------
+
+
+        
+    
+        #------------------------------------
+
+
+        #------------------------------------
+
+    
+  
+        #------------------------------------
+
+     
+        #------------------------------------
+
+        #Eq. (58) Auxilary Terms
+        #"""
+        data['portf_aprrox_value_4']=( np.exp(-r_tauT*tau_mat)*data['future_VIX^2']
+                                        +2*(data[f'1 month S_T']/data['2 month F']-np.exp(-r_tauT*tau_mat))
+                                        -2*fwd_payoff_longTerm
+                                        +2*(1-np.exp(-r_tauT*tau_mat) )*np.log(data[f'1 month S_T']/data[f'1 month F'])
+                                        -2*np.exp(-r_tauT*tau_mat)*(r_0tau*tau_mat_0 + r_tauT*tau_mat - r_0T*T_mat ) )
+        #data['log_approx']=2*fwd_payoff-opt_payoff
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['Trade Date'],2*(data[f'1 month S_T']/data['2 month F']-np.exp(-r_tauT*tau_mat) ) - 2*fwd_payoff_longTerm  ,label=r'$2(\frac{S_\tau}{F_{0,T}}-e^{-r_{\tau,T}(T-\tau)})-2(\frac{S_\tau}{F_{0,T}}-1)$',alpha=0.6)
+        plt.plot(data['Trade Date'],2*(1-np.exp(-r_tauT*tau_mat) )*np.log(data[f'1 month S_T']/data[f'1 month F']),label=r'$2(1-e^{r_{\tau,T}(T-\tau)})\cdot \log(\frac{S_\tau}{F_{0,T}})$',alpha=a)
+        plt.plot(data['Trade Date'],-2*np.exp(-r_tauT*tau_mat)*(r_0tau*tau_mat_0 + r_tauT*tau_mat - r_0T*T_mat ),label=r'$-2e^{r_{\tau,T}(T-\tau)} \{ r_{0,\tau}\tau + r_{\tau,T}(T-\tau)-r_{0,T}T \}$',alpha=a)
+        #plt.plot(data['Trade Date'],2*(1-np.exp(-r_tauT*tau_mat) ) ,label=r'$2(1-e^{r_{\tau,T}(T-\tau)})$',alpha=a)
+        #plt.plot(data['Trade Date'],2*(1-np.exp(-r_tauT*tau_mat) ) ,label=r'$new term$',alpha=a)
+        #plt.plot(data['Trade Date'],2*(1-np.exp(-r_tauT*tau_mat) ) - 2*np.exp(-r_tauT*tau_mat)*(1-np.exp(r_0T*(T_mat-0))) ,label=r'$new term$',alpha=a)
+        plt.plot(data['Trade Date'],np.exp(-r_tauT*tau_mat)*data['future_VIX^2'],label=r'$(T-\tau) \cdot VIX^2_\tau(T-\tau)$',alpha=a)
+        plt.plot(data['Trade Date'],2*(1-np.exp(-r_tauT*tau_mat) )*(1+np.log(data[f'1 month S_T']/data[f'1 month F']))  ,label=r'factored term',alpha=a)
+        plt.title('Eq. (58) Auxilary Terms')
+        #plt.legend()
+        plt.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center',ncol=1)
+        pdf.savefig(bbox_inches='tight')
+        plt.close()
+        #"""
+        #------------------------------------
+
+    
+        #------------------------------------
+
+        
+        #------------------------------------
+
+
+        #------------------------------------
+
+
+
+
+        
+       
+
+
+
+
+
+
+
 
 
 #summ_stats_3.to_csv('hedged_vix_returns/hedged_returns_summary_stats.csv')
@@ -707,7 +1205,9 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                                             f'{3} month number of options',f'{2} month number of options',f'{1} month number of options',
                                             f'{3} month market gross return',f'{2} month market gross return',f'{1} month market gross return',
                                             f'{3} month max moneyness',f'{2} month max moneyness',f'{1} month max moneyness',
-                                            f'{3} month min moneyness',f'{2} month min moneyness',f'{1} month min moneyness']]
+                                            f'{3} month min moneyness',f'{2} month min moneyness',f'{1} month min moneyness',
+                                            f'{3} month F',f'{2} month F',f'{1} month F',
+                                            f'{3} month S_T',f'{2} month S_T',f'{1} month S_T']]
 
                             if cutoff_year:
                                 data=data[data['Trade Date'].dt.year>=cutoff_year]
@@ -721,9 +1221,16 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             data['VAR(t)']=data[f'1 month {v}'].shift(0).astype(float)
                             data['FVAR(t,t+k+1)']=(data[f'{k+1} month {v}']-data[f'{k} month {v}']).astype(float)
                             data['H']=data['FVAR(t,t+k+1)']-data['VAR(t+k)']
-                            data['H_discrete']=data[f'{k+1} month {v} liquidation']-data[f'{k} month {v} payoff']-(data[f'{k+1} month {v}']-data[f'{k} month {v}'])
+
+                            #H_discrete=X-Y
+                            #put-call parity adjustment
+                            #pcp_adjust=data[f'{k} month F'].shift(-k)/data[f'{k+1} month F']-1-np.log(data[f'{k} month F'].shift(-k).astype(float)/data[f'{k+1} month F'].astype(float))
+                            #hedge_term=data[f'{k} month S_T']/data[f'{k} month F'].astype(float)-1
+                            data['H_discrete']=data['FVAR(t,t+k+1)']-data['VAR(t)']
+                            #data['H_discrete']-=data[f'{k+1} month {v} liquidation']-data[f'{k} month {v} payoff']+hedge_term-pcp_adjust - (data[f'{k} month {v}'])
+                            #data['H_discrete']=data[f'{k+1} month {v} liquidation']-data[f'{k} month {v} payoff']-(data[f'{k} month {v}'])
                             data['H_discrete']=data['H_discrete'].astype(float)
-                            data['H_discrete']*=-1
+                            #data['H_discrete']*=-1
 
                             #data['H']=data['FVAR(t,t+k+1)']-(data['VAR(t+k)']-data['VAR(t)'])
                             data['FVAR(t,t+k+1) - VAR(t+k)']=data['FVAR(t,t+k+1)']-data['VAR(t+k)']
@@ -803,7 +1310,7 @@ def expectation_hypothesis_regressions(monthly_portfolios,cutoff_year=None):
                             x=sm.add_constant(data['FVAR(t,t+k+1)']-data['VAR(t)'])
                             ols_model = sm.OLS(y, x)
                             dual_ols_results = ols_model.fit(cov_type='HAC', cov_kwds={'maxlags':round(3/4*(data.shape[0])**(1/3))})
-                            fh.write(dual_ols_results.summary().as_text())
+                            fh.write(dual_ols_results.summary(yname='liquidation-payoff+hedge-pcp',xname=['Intercept',f'F{v}(t,t+k+1)-{v}(t)']).as_text())
                             fh.write("\n\n")
 
                             data['alpha_primal']=primal_ols_results.params['const']
